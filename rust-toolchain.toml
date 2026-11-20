@@ -1,0 +1,3 @@
+[toolchain]
+# MSVC Build Tools are not installed on this machine; the GNU toolchain ships its own linker.
+channel = "stable-x86_64-pc-windows-gnu"
