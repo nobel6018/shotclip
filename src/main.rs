@@ -212,12 +212,18 @@ fn tip(paused: bool) -> &'static str {
     if paused { "ShrinkClip (일시정지)" } else { "ShrinkClip: 클립보드 이미지 최적화 중" }
 }
 
+/// Icon resource 1 (embedded by build.rs) at the given size, falling back to the stock icon.
+unsafe fn app_icon(size: i32) -> HICON {
+    let h = LoadImageW(GetModuleHandleW(null()), 1 as _, IMAGE_ICON, size, size, LR_DEFAULTCOLOR);
+    if h.is_null() { LoadIconW(null_mut(), IDI_APPLICATION) } else { h as HICON }
+}
+
 unsafe fn tray_add(hwnd: HWND) {
     let paused = with_app(|a| a.paused).unwrap_or(false);
     let mut n = nid(hwnd);
     n.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     n.uCallbackMessage = WM_TRAY;
-    n.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    n.hIcon = app_icon(GetSystemMetrics(SM_CXSMICON));
     copy_w(&mut n.szTip, tip(paused));
     Shell_NotifyIconW(NIM_ADD, &n);
 }
@@ -434,6 +440,7 @@ fn main() {
         let mut wc: WNDCLASSW = zeroed();
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinst;
+        wc.hIcon = app_icon(GetSystemMetrics(SM_CXICON));
         wc.lpszClassName = class.as_ptr();
         RegisterClassW(&wc);
         let hwnd = CreateWindowExW(

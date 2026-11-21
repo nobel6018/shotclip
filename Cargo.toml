@@ -1,6 +1,6 @@
 [package]
 name = "shrinkclip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Clop-style clipboard screenshot optimiser for Windows"
 license = "GPL-3.0-or-later" # imagequant (libimagequant) is GPL-3.0

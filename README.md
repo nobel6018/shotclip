@@ -1,5 +1,7 @@
 # ShrinkClip
 
+<img src="assets/shrinkclip.png" width="96" alt="ShrinkClip icon">
+
 Windows 트레이 앱. **Win+Shift+S** 등으로 클립보드에 복사된 스크린샷을 자동으로 최적화합니다.
 macOS의 [Clop](https://github.com/FuzzyIdeas/Clop) 클립보드 최적화 동작을 Windows용으로 옮긴 것입니다.
 
@@ -41,6 +43,9 @@ cargo build --release
 ```
 
 `rust-toolchain.toml`이 GNU 툴체인을 지정합니다(MSVC Build Tools 없이 빌드 가능).
+
+아이콘은 `assets/shrinkclip.ico`이며 `build.rs`가 windres 없이 exe 리소스로 넣습니다.
+아이콘을 다시 그리려면 `cargo run --example gen_icon`.
 
 ## 라이선스
 
