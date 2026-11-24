@@ -1,0 +1,47 @@
+[
+  {
+    "action": "tool:arrow"
+  },
+  {
+    "action": "tool:rect"
+  },
+  {
+    "action": "tool:line"
+  },
+  {
+    "action": "tool:oval"
+  },
+  {
+    "action": "tool:text"
+  },
+  {
+    "action": "tool:blur"
+  },
+  {
+    "action": "tool:counter"
+  },
+  {
+    "action": "tool:spotlight"
+  },
+  {
+    "action": "tool:pen"
+  },
+  {
+    "action": "tool:highlight"
+  },
+  {
+    "action": "tool:select"
+  },
+  {
+    "action": "tool:magnifier"
+  },
+  {
+    "action": "tool:rect"
+  },
+  {
+    "action": "tool:counter"
+  },
+  {
+    "action": "tool:arrow"
+  }
+]

@@ -1,0 +1,263 @@
+# ShotClip 편집기 ↔ Shottr 1.10.0b 편집기 parity spec (rea-port).
+# 원본 쪽은 Shottr를 Windows에서 실행할 수 없어 디컴파일/nib에서 옮긴 모델(original/shottr-keys.mjs)이고,
+# --record 로 golden/ 에 기록한다. macOS Cmd = Windows Ctrl.
+# 실행: node <rea-check.mjs> --spec parity/parity.yaml
+
+systems:
+  original: { cwd: original }
+  target: { cwd: ../target/release }
+
+features:
+  - id: keys.tools
+    title: 도구 단축키 (A R L O T B C S D H V M)
+    source: ["rea: FUN_1000296c0 kh:968-1088 (+MainMenu.nib Magnifier m)"]
+    checks:
+      - type: parity
+        golden: golden/keys.tools.json
+        inputs:
+          - {"key": "A", "ctx": "none"}
+          - {"key": "R", "ctx": "none"}
+          - {"key": "L", "ctx": "none"}
+          - {"key": "O", "ctx": "none"}
+          - {"key": "T", "ctx": "none"}
+          - {"key": "B", "ctx": "none"}
+          - {"key": "C", "ctx": "none"}
+          - {"key": "S", "ctx": "none"}
+          - {"key": "D", "ctx": "none"}
+          - {"key": "H", "ctx": "none"}
+          - {"key": "V", "ctx": "none"}
+          - {"key": "M", "ctx": "none"}
+          - {"key": "R", "ctx": "object"}
+          - {"key": "C", "ctx": "object"}
+          - {"key": "A", "ctx": "none", "alt": true}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.area
+    title: 영역 선택 단축키 (변환, 지우기, 이동, 크기, 자르기)
+    source: ["rea: FUN_1000296c0 kh:1138-1388, FUN_100183190 kd2:10085-11090"]
+    checks:
+      - type: parity
+        golden: golden/keys.area.json
+        inputs:
+          - {"key": "R", "ctx": "area"}
+          - {"key": "O", "ctx": "area"}
+          - {"key": "S", "ctx": "area"}
+          - {"key": "M", "ctx": "area"}
+          - {"key": "B", "ctx": "area"}
+          - {"key": "B", "ctx": "area", "shift": true}
+          - {"key": "Delete", "ctx": "area"}
+          - {"key": "Backspace", "ctx": "area"}
+          - {"key": "Left", "ctx": "area"}
+          - {"key": "Right", "ctx": "area", "shift": true}
+          - {"key": "Up", "ctx": "area"}
+          - {"key": "Down", "ctx": "area", "shift": true}
+          - {"key": "Right", "ctx": "area", "ctrl": true}
+          - {"key": "Down", "ctx": "area", "shift": true, "ctrl": true}
+          - {"key": "Left", "ctx": "area", "ctrl": true}
+          - {"key": "]", "ctx": "area"}
+          - {"key": "9", "ctx": "area"}
+          - {"key": "[", "ctx": "area"}
+          - {"key": "8", "ctx": "area"}
+          - {"key": "]", "ctx": "area", "shift": true}
+          - {"key": "[", "ctx": "area", "shift": true}
+          - {"key": "C", "ctx": "area"}
+          - {"key": "A", "ctx": "area"}
+          - {"key": "Enter", "ctx": "area"}
+          - {"key": "Esc", "ctx": "area"}
+          - {"key": "C", "ctx": "area", "ctrl": true}
+          - {"key": "O", "ctx": "area", "ctrl": true}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.color
+    title: 색 복사 (Tab, Shift+Tab, I)
+    source: ["rea: FUN_1000296c0 kh:117-160, 654-853; FUN_1001e10f0 kd2:5931"]
+    checks:
+      - type: parity
+        golden: golden/keys.color.json
+        inputs:
+          - {"key": "Tab", "ctx": "none"}
+          - {"key": "Tab", "ctx": "none", "shift": true}
+          - {"key": "I", "ctx": "none"}
+          - {"key": "I", "ctx": "none", "shift": true}
+          - {"key": "I", "ctx": "object"}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.object
+    title: 선택한 개체 단축키
+    source: ["rea: FUN_1001e10f0 kd2:5957-7002; kh:1818"]
+    checks:
+      - type: parity
+        golden: golden/keys.object.json
+        inputs:
+          - {"key": "Delete", "ctx": "object"}
+          - {"key": "Backspace", "ctx": "object"}
+          - {"key": "D", "ctx": "object", "ctrl": true}
+          - {"key": "]", "ctx": "object", "ctrl": true}
+          - {"key": "[", "ctx": "object", "ctrl": true}
+          - {"key": "C", "ctx": "object", "ctrl": true}
+          - {"key": "V", "ctx": "none", "ctrl": true}
+          - {"key": "Tab", "ctx": "object"}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.global
+    title: 전역 단축키 (Esc, 복사, 되돌리기, 저장, OCR, 텍스트 입력)
+    source: ["rea: FUN_1000296c0 kh:93-649, 1647-1808; MainMenu.nib"]
+    checks:
+      - type: parity
+        golden: golden/keys.global.json
+        inputs:
+          - {"key": "Esc", "ctx": "none"}
+          - {"key": "Esc", "ctx": "drawing"}
+          - {"key": "C", "ctx": "none", "ctrl": true}
+          - {"key": "Z", "ctx": "none", "ctrl": true}
+          - {"key": "Z", "ctx": "none", "shift": true, "ctrl": true}
+          - {"key": "S", "ctx": "none", "ctrl": true}
+          - {"key": "S", "ctx": "none", "shift": true, "ctrl": true}
+          - {"key": "O", "ctx": "none", "ctrl": true}
+          - {"key": "P", "ctx": "none"}
+          - {"key": "X", "ctx": "text"}
+          - {"key": "R", "ctx": "text"}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.zoom
+    title: 확대/축소 단축키
+    source: ["rea: MainMenu.nib Zoom menu; FUN_10001fae0"]
+    checks:
+      - type: parity
+        golden: golden/keys.zoom.json
+        inputs:
+          - {"key": "=", "ctx": "none", "ctrl": true}
+          - {"key": "-", "ctx": "none", "ctrl": true}
+          - {"key": "1", "ctx": "none", "ctrl": true}
+          - {"key": "0", "ctx": "none", "ctrl": true}
+          - {"key": "2", "ctx": "none", "ctrl": true}
+          - {"key": "=", "ctx": "none", "shift": true}
+          - {"key": "-", "ctx": "none", "shift": true}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.ruler
+    title: 자 (화살표, 1, 2)
+    source: ["rea: FUN_1000bd0d0"]
+    checks:
+      - type: parity
+        golden: golden/keys.ruler.json
+        inputs:
+          - {"key": "Left", "ctx": "none"}
+          - {"key": "Down", "ctx": "none"}
+          - {"key": "1", "ctx": "none"}
+          - {"key": "2", "ctx": "none"}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.corners
+    title: 선택 모서리 Q/W
+    source: ["rea: MainMenu.nib Selection Top Left q / Bottom Right w"]
+    checks:
+      - type: parity
+        golden: golden/keys.corners.json
+        inputs:
+          - {"key": "Q", "ctx": "none"}
+          - {"key": "W", "ctx": "none"}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: keys.extra
+    title: 백드롭, 핀, 캡처 추가, 업로드, 래스터화 단축키
+    source: ["rea: kh:858-942, 1091-1133; FUN_10015bcc0; MainMenu.nib"]
+    checks:
+      - type: parity
+        golden: golden/keys.extra.json
+        inputs:
+          - {"key": "K", "ctx": "none"}
+          - {"key": "P", "ctx": "none", "ctrl": true}
+          - {"key": "A", "ctx": "none", "ctrl": true}
+          - {"key": "F2", "ctx": "none"}
+          - {"key": "E", "ctx": "none", "ctrl": true}
+          - {"key": "R", "ctx": "none", "shift": true, "ctrl": true}
+        original: { run: [node, shottr-keys.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  # ---------------------------------------------------------------- behaviour (not just dispatch)
+  - id: area.ops
+    title: 영역 선택 이동/크기/늘리기·줄이기 결과 (이미지 안쪽 값만; 가장자리 처리는 원본 미확인)
+    source: ["rea: FUN_100183190 kd2:10085-11090"]
+    checks:
+      - type: parity
+        golden: golden/area.ops.json
+        inputs:
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Left"}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Right", "shift": true}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Up", "shift": true}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Down"}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Right", "ctrl": true}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Left", "ctrl": true, "shift": true}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "Down", "ctrl": true, "shift": true}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "]"}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "9", "shift": true}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "["}
+          - {"op": "area", "rect": [100, 100, 200, 150], "w": 800, "h": 600, "key": "8", "shift": true}
+        original: { run: [node, shottr-ops.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  - id: color.darkest
+    title: Shift+Tab 가장 어두운 색 (커서-10, 20×20 상자 경계)
+    source: ["rea: FUN_1000296c0 kh:742-853 (DAT_1002442f8=-10, DAT_100243f78=20)"]
+    checks:
+      - type: parity
+        golden: golden/color.darkest.json
+        inputs:
+          - {"op": "darkest", "w": 100, "h": 100, "x": 50, "y": 50, "dark": [40, 40, 10, 20, 30]}
+          - {"op": "darkest", "w": 100, "h": 100, "x": 50, "y": 50, "dark": [59, 59, 10, 20, 30]}
+          - {"op": "darkest", "w": 100, "h": 100, "x": 50, "y": 50, "dark": [60, 50, 10, 20, 30]}
+          - {"op": "darkest", "w": 100, "h": 100, "x": 50, "y": 50, "dark": [39, 50, 10, 20, 30]}
+          - {"op": "darkest", "w": 100, "h": 100, "x": 50, "y": 50, "dark": [45, 45, 200, 200, 200, 55, 52, 20, 20, 20]}
+          - {"op": "darkest", "w": 100, "h": 100, "x": 3, "y": 97, "dark": [0, 99, 0, 0, 0]}
+        original: { run: [node, shottr-ops.mjs] }
+        target: { run: [./shotclip.exe, --probe] }
+
+  # ---------------------------------------------------------------- not ported yet (MISS until done or deferred by the user)
+  - id: backdrop
+    title: 배경(Backdrop) 패널 — 그라데이션, 여백, 모서리, 그림자 (K)
+    source: ["rea: kh:1091, BackdropPanel nib"]
+  - id: pin
+    title: 화면에 고정(Pin) (Ctrl+P)
+    source: ["rea: kh:858-929, MainMenu.nib Pin"]
+  - id: upload
+    title: 업로드 (F2, Ctrl+E)
+    source: ["rea: FUN_10015bcc0, MainMenu.nib Upload"]
+  - id: addcapture
+    title: 캡처 추가 (Ctrl+A)
+    source: ["rea: kh:936"]
+  - id: rasterize
+    title: 래스터화 (Ctrl+Shift+R)
+    source: ["rea: MainMenu.nib Rasterize ⌘⇧R"]
+  - id: rotate
+    title: 시계/반시계 회전
+    source: ["rea: MainMenu.nib Rotate CW / CCW"]
+  - id: tool.options
+    title: 도구 옵션 — 화살표 형태(shape/handdrawn/line/double), 점선, 채우기(translucent/opaque/handdrawn), 텍스트 글꼴(sans/goofy), 가리기 종류(Blur Text/Erase Text)
+    source: ["rea: Main.nib segmented controls (arrow, line, fill, shape, text, conceal)"]
+  - id: selection.imprint
+    title: 선택 영역 크기 표시(Imprint Selection Size)
+    source: ["rea: selection toolbar nib"]
+  - id: selection.cutout
+    title: 잘라내기(Cut Out)
+    source: ["rea: selection toolbar nib"]
+  - id: image.resize
+    title: 이미지 크기 바꾸기 (⇧])
+    source: ["rea: selection toolbar nib Resize ⇧]"]
+  - id: snap
+    title: 개체에 맞추기(Snap to Objects)
+    source: ["rea: MainMenu.nib Snap to Objects"]
+  - id: crop.reset
+    title: 자르기 되돌리기(Reset Crop) 메뉴 — 지금은 Ctrl+Z로만
+    source: ["rea: MainMenu.nib Reset Crop"]
+  - id: open.clipboard
+    title: 클립보드에서 열기 (Ctrl+Shift+V)
+    source: ["rea: MainMenu.nib 'V' with Cmd+Shift"]

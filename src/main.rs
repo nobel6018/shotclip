@@ -17,6 +17,7 @@ mod annot;
 mod capture;
 mod clip;
 mod editor;
+mod keymap;
 mod ocr;
 mod optimize;
 mod overlay;
@@ -740,6 +741,14 @@ unsafe fn edit_file(path: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "--probe" {
+        // rea-check harness (parity/parity.yaml): stdin JSON -> stdout JSON, no UI.
+        use std::io::{Read, Write};
+        let mut s = String::new();
+        let _ = std::io::stdin().read_to_string(&mut s);
+        let _ = std::io::stdout().write_all(keymap::probe(&s).as_bytes());
+        return;
+    }
     if args.len() >= 3 && args[1] == "--edit" {
         unsafe { edit_file(&args[2]) };
         return;

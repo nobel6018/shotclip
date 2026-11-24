@@ -1,0 +1,26 @@
+[
+  {
+    "action": "obj:delete"
+  },
+  {
+    "action": "obj:delete"
+  },
+  {
+    "action": "obj:duplicate"
+  },
+  {
+    "action": "obj:size:+1"
+  },
+  {
+    "action": "obj:size:-1"
+  },
+  {
+    "action": "obj:copy"
+  },
+  {
+    "action": "obj:paste"
+  },
+  {
+    "action": "obj:next"
+  }
+]

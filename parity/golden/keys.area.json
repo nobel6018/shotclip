@@ -1,0 +1,83 @@
+[
+  {
+    "action": "area:rect"
+  },
+  {
+    "action": "area:oval"
+  },
+  {
+    "action": "area:spotlight"
+  },
+  {
+    "action": "area:magnifier"
+  },
+  {
+    "action": "area:blur"
+  },
+  {
+    "action": "area:blur"
+  },
+  {
+    "action": "area:erase"
+  },
+  {
+    "action": "area:erase"
+  },
+  {
+    "action": "area:move:-1,0"
+  },
+  {
+    "action": "area:move:10,0"
+  },
+  {
+    "action": "area:move:0,-1"
+  },
+  {
+    "action": "area:move:0,10"
+  },
+  {
+    "action": "area:resize:1,0"
+  },
+  {
+    "action": "area:resize:0,10"
+  },
+  {
+    "action": "area:resize:-1,0"
+  },
+  {
+    "action": "area:grow:1"
+  },
+  {
+    "action": "area:grow:1"
+  },
+  {
+    "action": "area:grow:-1"
+  },
+  {
+    "action": "area:grow:-1"
+  },
+  {
+    "action": "area:grow:10"
+  },
+  {
+    "action": "area:grow:-10"
+  },
+  {
+    "action": "area:avgcolor"
+  },
+  {
+    "action": "area:autoadjust"
+  },
+  {
+    "action": "area:crop"
+  },
+  {
+    "action": "area:clear"
+  },
+  {
+    "action": "area:copy"
+  },
+  {
+    "action": "area:ocr"
+  }
+]

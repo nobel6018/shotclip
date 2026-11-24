@@ -14,6 +14,8 @@ use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
+    /// Shottr's default tool: drag = area selection, click = select / move objects.
+    Select,
     Arrow,
     Rect,
     Oval,
@@ -24,7 +26,8 @@ pub enum Tool {
     Blur,
     Erase,
     Counter,
-    Crop,
+    Spotlight,
+    Magnifier,
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +42,16 @@ pub enum Shape {
     Blur,
     Erase,
     Counter(u32),
+    /// Everything outside the union of spotlights is dimmed (Shottr ObjSpotlight).
+    Spotlight,
+    /// `a`/`b` = source area; the lens (centre given) shows it enlarged (Shottr ObjMagnifier).
+    Magnifier((f32, f32)),
 }
+
+/// Magnifier lens enlargement.
+pub const MAG_FACTOR: f32 = 2.0;
+/// Spotlight: how much of the image stays visible outside the spotlights.
+pub const SPOT_KEEP: f32 = 0.45;
 
 #[derive(Clone, Debug)]
 pub struct Obj {
@@ -105,6 +117,11 @@ impl Obj {
                 let r = s.counter_r(self.size) + 2.0;
                 (self.a.0 - r, self.a.1 - r, self.a.0 + r, self.a.1 + r)
             }
+            Shape::Magnifier(c) => {
+                let (x0, y0, x1, y1) = self.norm();
+                let r = self.lens_r() + pad;
+                (x0.min(c.0 - r) - pad, y0.min(c.1 - r) - pad, x1.max(c.0 + r) + pad, y1.max(c.1 + r) + pad)
+            }
             _ => {
                 let (x0, y0, x1, y1) = self.norm();
                 (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
@@ -115,10 +132,14 @@ impl Obj {
     pub fn translate(&mut self, dx: f32, dy: f32) {
         self.a = (self.a.0 + dx, self.a.1 + dy);
         self.b = (self.b.0 + dx, self.b.1 + dy);
-        if let Shape::Pen(pts) = &mut self.shape {
-            for p in pts {
-                *p = (p.0 + dx, p.1 + dy);
+        match &mut self.shape {
+            Shape::Pen(pts) => {
+                for p in pts {
+                    *p = (p.0 + dx, p.1 + dy);
+                }
             }
+            Shape::Magnifier(c) => *c = (c.0 + dx, c.1 + dy),
+            _ => {}
         }
     }
 
@@ -135,17 +156,27 @@ impl Obj {
                 let bb = self.bubble(s).unwrap();
                 rr_dist(x, y, &bb) <= tol || bb.tail.is_some_and(|t| tri_dist(x, y, t) <= tol)
             }
-            Shape::Highlight | Shape::Blur | Shape::Erase | Shape::Counter(_) => {
-                let b = self.bounds(s);
+            Shape::Highlight | Shape::Blur | Shape::Erase | Shape::Counter(_) | Shape::Spotlight => {
+                let b = if matches!(self.shape, Shape::Spotlight) { self.norm() } else { self.bounds(s) };
                 x >= b.0 - tol && x <= b.2 + tol && y >= b.1 - tol && y <= b.3 + tol
             }
+            Shape::Magnifier(c) => {
+                (x >= x0 - tol && x <= x1 + tol && y >= y0 - tol && y <= y1 + tol)
+                    || (x - c.0).hypot(y - c.1) <= self.lens_r() + tol
+            }
         }
+    }
+
+    /// Lens radius: the source area enlarged by `MAG_FACTOR`.
+    pub fn lens_r(&self) -> f32 {
+        let (x0, y0, x1, y1) = self.norm();
+        (x1 - x0).max(y1 - y0) * MAG_FACTOR / 2.0
     }
 
     /// Hit only near the outline (area objects: so you can draw inside a blur/highlight).
     pub fn hit_edge(&self, s: Scale, x: f32, y: f32, tol: f32) -> bool {
         match self.shape {
-            Shape::Highlight | Shape::Blur | Shape::Erase => {
+            Shape::Highlight | Shape::Blur | Shape::Erase | Shape::Spotlight => {
                 let (x0, y0, x1, y1) = self.norm();
                 rect_dist(x, y, x0, y0, x1, y1).abs() <= tol + 2.0
             }
@@ -313,10 +344,55 @@ fn clip_box(b: (f32, f32, f32, f32), w: u32, h: u32) -> Option<(usize, usize, us
 /// Draws every object over a copy of `base`.
 pub fn render(base: &Rgba, objs: &[Obj], s: Scale) -> Rgba {
     let mut out = Rgba { w: base.w, h: base.h, px: base.px.clone() };
-    for o in objs {
+    // Spotlights dim the image (and the objects below the first spotlight) once, outside the
+    // union of all spotlight areas; objects above stay bright.
+    let spots: Vec<_> = objs.iter().filter(|o| matches!(o.shape, Shape::Spotlight)).map(|o| o.norm()).collect();
+    let first = objs.iter().position(|o| matches!(o.shape, Shape::Spotlight));
+    for (i, o) in objs.iter().enumerate() {
+        if Some(i) == first {
+            dim_outside(&mut out, &spots);
+        }
         draw(&mut out, base, o, s);
     }
     out
+}
+
+/// Darkens every pixel outside all `spots` (antialiased edges).
+pub fn dim_outside(img: &mut Rgba, spots: &[(f32, f32, f32, f32)]) {
+    let w = img.w as usize;
+    for y in 0..img.h as usize {
+        let py = y as f32 + 0.5;
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            // coverage of the lit area at this pixel
+            let lit = spots
+                .iter()
+                .map(|&(x0, y0, x1, y1)| cov(0.0, rect_dist(px, py, x0, y0, x1, y1)))
+                .fold(0f32, f32::max);
+            let k = SPOT_KEEP + (1.0 - SPOT_KEEP) * lit;
+            if k < 0.999 {
+                let i = (y * w + x) * 4;
+                for c in 0..3 {
+                    img.px[i + c] = (img.px[i + c] as f32 * k).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Where a new magnifier's lens goes: beside the source area, inside the image if possible.
+pub fn place_lens(area: (f32, f32, f32, f32), w: u32, h: u32) -> (f32, f32) {
+    let (x0, y0, x1, y1) = (area.0.min(area.2), area.1.min(area.3), area.0.max(area.2), area.1.max(area.3));
+    let r = (x1 - x0).max(y1 - y0) * MAG_FACTOR / 2.0;
+    let gap = r * 0.35 + 8.0;
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (w, h) = (w as f32, h as f32);
+    let fits = |c: (f32, f32)| c.0 - r >= 0.0 && c.0 + r <= w && c.1 - r >= 0.0 && c.1 + r <= h;
+    let cands = [(x1 + gap + r, cy), (x0 - gap - r, cy), (cx, y1 + gap + r), (cx, y0 - gap - r)];
+    cands
+        .into_iter()
+        .find(|&c| fits(c))
+        .unwrap_or_else(|| (cands[0].0.min(w - r).max(r.min(w / 2.0)), cy.clamp(r.min(h / 2.0), (h - r).max(h / 2.0))))
 }
 
 /// Draws one object onto `out`; blur/erase sample `orig`.
@@ -409,6 +485,45 @@ pub fn draw(out: &mut Rgba, orig: &Rgba, o: &Obj, s: Scale) {
                 blit_mask(&mut cv, &mask, mw, mh, o.a.0.round() as i32, o.a.1.round() as i32, fg, 1.0);
             }
         }
+        Shape::Spotlight => {} // see render / dim_outside
+        Shape::Magnifier(c) => {
+            let (x0, y0, x1, y1) = o.norm();
+            let r = o.lens_r();
+            let hw = s.stroke(0) / 2.0;
+            // Snapshot of the current picture: the lens may cover its own source.
+            let src = Rgba { w: cv.img.w, h: cv.img.h, px: cv.img.px.clone() };
+            let (sx, sy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            let (lx, ly) = *c;
+            // Connector from the area's edge toward the lens, then the area outline.
+            let d = (lx - sx).hypot(ly - sy).max(1.0);
+            let (ux, uy) = ((lx - sx) / d, (ly - sy) / d);
+            let t = ((x1 - x0) / 2.0 / ux.abs().max(1e-3)).min((y1 - y0) / 2.0 / uy.abs().max(1e-3));
+            let p0 = (sx + ux * t, sy + uy * t);
+            let p1 = (lx - ux * r, ly - uy * r);
+            cv.shade(o.bounds(s), o.color, |x, y| {
+                cov(hw, seg_dist(x, y, p0, p1)).max(cov(hw, rect_dist(x, y, x0, y0, x1, y1).abs()))
+            });
+            let Some((bx0, by0, bx1, by1)) = clip_box((lx - r - 2.0, ly - r - 2.0, lx + r + 2.0, ly + r + 2.0), cv.img.w, cv.img.h) else { return };
+            let ring = s.stroke(o.size);
+            let w = cv.img.w as usize;
+            for y in by0..by1 {
+                for x in bx0..bx1 {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let dist = (px - lx).hypot(py - ly);
+                    let a = cov(0.0, dist - r);
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    let (qx, qy) = (sx + (px - lx) / MAG_FACTOR, sy + (py - ly) / MAG_FACTOR);
+                    let p = sample(&src, qx, qy);
+                    let i = (y * w + x) * 4;
+                    for k in 0..3 {
+                        cv.img.px[i + k] = (cv.img.px[i + k] as f32 * (1.0 - a) + p[k] * a).round() as u8;
+                    }
+                    cv.blend(x as i32, y as i32, o.color, cov(ring / 2.0, (dist - r + ring / 2.0).abs()) * a.max(0.999));
+                }
+            }
+        }
         Shape::Counter(n) => {
             let rad = s.counter_r(o.size);
             let (cx, cy) = o.a;
@@ -462,6 +577,24 @@ fn tri_dist(px: f32, py: f32, t: [(f32, f32); 3]) -> f32 {
         }
     }
     if inside { -d } else { d }
+}
+
+/// Bilinear sample (RGB) clamped to the image.
+fn sample(img: &Rgba, x: f32, y: f32) -> [f32; 3] {
+    let (w, h) = (img.w as i32, img.h as i32);
+    let (fx, fy) = ((x - 0.5).max(0.0), (y - 0.5).max(0.0));
+    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+    let at = |x: i32, y: i32| {
+        let i = ((y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) * 4) as usize;
+        [img.px[i] as f32, img.px[i + 1] as f32, img.px[i + 2] as f32]
+    };
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+    let mut o = [0f32; 3];
+    for k in 0..3 {
+        o[k] = (a[k] * (1.0 - tx) + b[k] * tx) * (1.0 - ty) + (c[k] * (1.0 - tx) + d[k] * tx) * ty;
+    }
+    o
 }
 
 fn luma(c: u32) -> u32 {
@@ -649,6 +782,43 @@ mod tests {
     }
 
     #[test]
+    fn spotlight_dims_only_outside_all_spots() {
+        let base = blank(100, 100, 200);
+        let objs = [obj(Shape::Spotlight, (10.0, 10.0), (40.0, 40.0)), obj(Shape::Spotlight, (60.0, 60.0), (90.0, 90.0))];
+        let out = render(&base, &objs, Scale(1.0));
+        assert_eq!(at(&out, 25, 25), [200; 3]);
+        assert_eq!(at(&out, 75, 75), [200; 3]);
+        let dim = (200.0 * SPOT_KEEP).round() as u8;
+        assert_eq!(at(&out, 50, 50), [dim; 3]);
+        assert_eq!(at(&out, 5, 95), [dim; 3]);
+        // An object above the spotlight stays bright.
+        let objs = [objs[0].clone(), obj(Shape::Rect, (70.0, 70.0), (90.0, 90.0))];
+        let out = render(&base, &objs, Scale(1.0));
+        assert_eq!(at(&out, 70, 80), [255, 0, 0]);
+    }
+
+    #[test]
+    fn magnifier_lens_shows_the_source_enlarged() {
+        let mut base = blank(200, 100, 255);
+        // A dark 4×4 dot at the centre of the source area (20..40).
+        for y in 28..32 {
+            for x in 28..32 {
+                let i = (y * 200 + x) * 4;
+                base.px[i..i + 3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        let c = place_lens((20.0, 20.0, 40.0, 40.0), 200, 100);
+        assert!(c.0 - 20.0 >= 40.0, "lens beside the area: {c:?}");
+        let o = Obj { shape: Shape::Magnifier(c), a: (20.0, 20.0), b: (40.0, 40.0), color: 0xFF0000, size: 1, tail: true };
+        let out = render(&base, &[o], Scale(1.0));
+        let (cx, cy) = (c.0 as u32, c.1 as u32);
+        assert_eq!(at(&out, cx, cy), [0, 0, 0]);
+        // The dot is 4 px wide in the source, ~8 px in the lens.
+        assert_eq!(at(&out, cx + 2, cy), [0, 0, 0]);
+        assert_eq!(at(&out, cx + 6, cy), [255, 255, 255]);
+    }
+
+    #[test]
     fn arrow_tip_and_shaft_are_coloured() {
         let base = blank(200, 100, 255);
         let out = render(&base, &[obj(Shape::Arrow, (10.0, 50.0), (190.0, 50.0))], Scale(1.0));
@@ -811,6 +981,11 @@ mod sample {
             o(Shape::Blur, (200.0, 462.0), (560.0, 500.0), 0, 1),
             o(Shape::Erase, (560.0, 412.0), (880.0, 450.0), 0, 1),
         ];
+        let mut objs = objs;
+        if std::env::var("SHOTCLIP_ANNOT_SPOT").is_ok() {
+            objs.push(o(Shape::Spotlight, (340.0, 20.0), (880.0, 180.0), 0, 1));
+            objs.push(o(Shape::Magnifier(place_lens((640.0, 300.0, 700.0, 340.0), w, h)), (640.0, 300.0), (700.0, 340.0), 0xE5383B, 1));
+        }
         let img = render(&base, &objs, s);
         std::fs::write(out, crate::optimize::encode_png(&img).unwrap()).unwrap();
     }

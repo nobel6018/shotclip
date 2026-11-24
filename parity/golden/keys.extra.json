@@ -1,0 +1,20 @@
+[
+  {
+    "action": "backdrop"
+  },
+  {
+    "action": "pin"
+  },
+  {
+    "action": "addcapture"
+  },
+  {
+    "action": "upload"
+  },
+  {
+    "action": "upload"
+  },
+  {
+    "action": "rasterize"
+  }
+]

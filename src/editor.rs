@@ -5,11 +5,15 @@
 //! image through the `export` callback (main.rs sends it through the same pipeline, overwriting
 //! the same Desktop file) and closes. Ctrl+S saves a copy elsewhere.
 //!
-//! Keys (our own Windows choice): A arrow, R rectangle, O oval, L line, D pen, T text,
-//! H highlighter, B blur, E erase, N counter, C crop; Ctrl+Z / Ctrl+Y undo/redo, Delete removes
-//! the selection, arrow keys nudge it, Tab copies the colour under the cursor, + / - / 0 / 1 zoom.
+//! Usability follows Shottr 1.10.0b (keys in keymap.rs, evidence in parity/shottr_keys.md):
+//! V select (drag = area selection, then R/O/B/S/M/Del turn it into an object, arrows move it,
+//! Ctrl+arrows resize, [ ] shrink/grow, Enter crops, Ctrl+C copies, Ctrl+O reads text), A arrow,
+//! R rectangle, O oval, L line, D pen, T text, H highlighter, B blur, S spotlight, M magnifier,
+//! C counter, E erase; Tab / Shift+Tab copy the colour (darkest) under the cursor, arrows / 1 / 2
+//! held measure, P px/pt, Ctrl+D duplicate, Ctrl+[ ] size, Ctrl+1 / Ctrl+0 / Ctrl+2 zoom.
 
 use crate::annot::{self, Obj, Scale, Shape, Tool};
+use crate::keymap::{self, Act, Ctx, Key, Mods};
 use crate::capture::Surface;
 use crate::clip::wide;
 use crate::optimize::Rgba;
@@ -33,7 +37,8 @@ pub const EDITOR_CLASS: &str = "ShotClipEditor";
 
 type Export = Box<dyn FnMut(Rgba)>;
 
-const TOOLS: [(Tool, char, &str); 11] = [
+const TOOLS: [(Tool, char, &str); 13] = [
+    (Tool::Select, 'V', "선택"),
     (Tool::Arrow, 'A', "화살표"),
     (Tool::Rect, 'R', "사각형"),
     (Tool::Oval, 'O', "원"),
@@ -42,10 +47,13 @@ const TOOLS: [(Tool, char, &str); 11] = [
     (Tool::Text, 'T', "텍스트"),
     (Tool::Highlight, 'H', "형광펜"),
     (Tool::Blur, 'B', "흐림"),
+    (Tool::Spotlight, 'S', "강조"),
+    (Tool::Magnifier, 'M', "돋보기"),
+    (Tool::Counter, 'C', "번호"),
     (Tool::Erase, 'E', "지우기"),
-    (Tool::Counter, 'N', "번호"),
-    (Tool::Crop, 'C', "자르기"),
 ];
+/// Custom message: OCR finished on the worker thread.
+const WM_EDITOR_OCR: u32 = WM_APP + 40;
 const COLORS: [u32; 8] = [0xE5383B, 0xF77F00, 0xFFD60A, 0x2DC653, 0x1E88E5, 0x8E44AD, 0x111111, 0xFFFFFF];
 const HL_DEFAULT: u32 = 0xFFE14D;
 
@@ -65,7 +73,10 @@ enum Drag {
     None,
     Draw,
     Move { last: (f32, f32), moved: bool },
-    Crop { start: (f32, f32) },
+    /// New area selection (Select tool).
+    Area { start: (f32, f32) },
+    /// Moving the area selection.
+    AreaMove { last: (f32, f32) },
     Pan { last: (i32, i32) },
     /// Text tool drag: the tail tip stays where the drag started, the box follows the cursor.
     TextTail { start: (f32, f32) },
@@ -93,7 +104,12 @@ struct Ed {
     live: Option<Obj>,
     /// Index the live object came from (moving / re-editing keeps its z-order).
     live_at: Option<usize>,
-    live_crop: Crop,
+    /// Area selection (Shottr "cutter"), image coordinates.
+    area: Crop,
+    /// P: sizes in points (physical px / scale) instead of pixels.
+    pt_units: bool,
+    /// Measuring while an arrow / 1 / 2 is held: true = horizontal.
+    ruler: Option<bool>,
     editing_text: bool,
     /// IME composition in progress (shown after the text, not yet part of it).
     comp: String,
@@ -122,8 +138,12 @@ thread_local! {
     static ED: RefCell<Option<Ed>> = const { RefCell::new(None) };
     static OPEN: Cell<HWND> = const { Cell::new(null_mut()) };
     /// Tool / colour / size survive between editor windows.
-    static PREFS: Cell<(Tool, u32, u8)> = const { Cell::new((Tool::Arrow, COLORS[0], 1)) };
+    static PREFS: Cell<(Tool, u32, u8)> = const { Cell::new((Tool::Select, COLORS[0], 1)) };
+    /// Ctrl+C / Ctrl+V of an object (survives between editor windows, like Shottr).
+    static OBJ_CLIP: RefCell<Option<Obj>> = const { RefCell::new(None) };
 }
+
+static OCR_OUT: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
 
 pub fn is_open() -> bool {
     !OPEN.with(Cell::get).is_null()
@@ -210,7 +230,9 @@ pub unsafe fn open(img: Rgba, title: &str, standalone: bool, export: Export) {
         live_box: None,
         live: None,
         live_at: None,
-        live_crop: None,
+        area: None,
+        pt_units: false,
+        ruler: None,
         editing_text: false,
         comp: String::new(),
         tail: true,
@@ -342,6 +364,14 @@ fn shown(e: &Ed) -> Option<Obj> {
 
 fn draw_live(e: &mut Ed) {
     let live = shown(e);
+    if let Some(o) = live.as_ref().filter(|o| matches!(o.shape, Shape::Spotlight)) {
+        let mut all = e.objs.clone();
+        all.insert(e.live_at.unwrap_or(all.len()).min(all.len()), o.clone());
+        e.work = annot::render(&e.base, &all, e.scale);
+        e.live_box = Some((0.0, 0.0, e.base.w as f32, e.base.h as f32));
+        to_disp(&e.work, &mut e.disp, None);
+        return;
+    }
     let new_box = live.as_ref().map(|o| o.bounds(e.scale));
     let dirty = union(e.live_box, new_box);
     let Some(r) = dirty.and_then(|d| clip_rect((d.0 - 2.0, d.1 - 2.0, d.2 + 2.0, d.3 + 2.0), e.base.w, e.base.h)) else {
@@ -641,18 +671,113 @@ unsafe fn frame(dc: HDC, r: RECT, color: u32, style: PEN_STYLE, width: i32) {
     DeleteObject(pen);
 }
 
-unsafe fn paint_crop(e: &Ed, dc: HDC) {
-    let Some(c) = e.live_crop.or(e.crop) else { return };
+unsafe fn shade_outside(e: &Ed, dc: HDC, c: (f32, f32, f32, f32), a: u8) -> RECT {
     let (x0, y0) = to_client(e, c.0.min(c.2), c.1.min(c.3));
     let (x1, y1) = to_client(e, c.0.max(c.2), c.1.max(c.3));
     let (ix0, iy0) = to_client(e, 0.0, 0.0);
     let (ix1, iy1) = to_client(e, e.base.w as f32, e.base.h as f32);
-    let a = 150;
     shade(dc, RECT { left: ix0, top: iy0, right: ix1, bottom: y0 }, a);
     shade(dc, RECT { left: ix0, top: y1, right: ix1, bottom: iy1 }, a);
     shade(dc, RECT { left: ix0, top: y0, right: x0, bottom: y1 }, a);
     shade(dc, RECT { left: x1, top: y0, right: ix1, bottom: y1 }, a);
-    frame(dc, RECT { left: x0 - 1, top: y0 - 1, right: x1 + 1, bottom: y1 + 1 }, 0xFFFFFF, PS_SOLID, 1);
+    RECT { left: x0, top: y0, right: x1, bottom: y1 }
+}
+
+unsafe fn paint_crop(e: &Ed, dc: HDC) {
+    if let Some(c) = e.crop {
+        let r = shade_outside(e, dc, c, 150);
+        frame(dc, RECT { left: r.left - 1, top: r.top - 1, right: r.right + 1, bottom: r.bottom + 1 }, 0xFFFFFF, PS_SOLID, 1);
+    }
+    if let Some(c) = e.area {
+        let r = shade_outside(e, dc, c, 90);
+        let r = RECT { left: r.left - 1, top: r.top - 1, right: r.right + 1, bottom: r.bottom + 1 };
+        frame(dc, r, 0xFFFFFF, PS_SOLID, 1);
+        frame(dc, r, 0x3DA5FF, PS_DOT, 1);
+        // Size label above the selection (Shottr shows it next to the cutter).
+        let (w, h) = area_size(e, c);
+        let label = format!(" {w} × {h} ");
+        let f = ui_font((12.0 * dpi(e)) as i32, true);
+        let of = SelectObject(dc, f);
+        let tw = text_w(dc, &label);
+        let th = (18.0 * dpi(e)) as i32;
+        let top = if r.top - th - 4 >= canvas(e).top { r.top - th - 4 } else { r.bottom + 4 };
+        let lr = RECT { left: r.left, top, right: r.left + tw, bottom: top + th };
+        fill(dc, &lr, 0x1E6FD9);
+        draw_text(dc, &label, &lr, 0xFFFFFF, DT_LEFT);
+        SelectObject(dc, of);
+        DeleteObject(f);
+    }
+    paint_ruler(e, dc);
+}
+
+/// Width × height of an area in the current units.
+fn area_size(e: &Ed, c: (f32, f32, f32, f32)) -> (u32, u32) {
+    let (w, h) = ((c.2 - c.0).abs(), (c.3 - c.1).abs());
+    let k = if e.pt_units { e.scale.0 } else { 1.0 };
+    ((w / k).round() as u32, (h / k).round() as u32)
+}
+
+/// Ruler (Shottr: hold an arrow / 1 / 2): from the pixel under the cursor out to where the
+/// colour changes, horizontally or vertically.
+fn ruler_span(e: &Ed, horiz: bool) -> Option<(u32, u32, u32)> {
+    let (x, y) = e.hover?;
+    let (w, h) = (e.base.w as i64, e.base.h as i64);
+    let (x, y) = (x.floor() as i64, y.floor() as i64);
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return None;
+    }
+    let px = |x: i64, y: i64| {
+        let i = ((y * w + x) * 4) as usize;
+        [e.work.px[i] as i32, e.work.px[i + 1] as i32, e.work.px[i + 2] as i32]
+    };
+    let c0 = px(x, y);
+    let same = |x: i64, y: i64| px(x, y).iter().zip(c0).map(|(a, b)| (a - b).abs()).max().unwrap() <= 24;
+    let (pos, len, fixed) = if horiz { (x, w, y) } else { (y, h, x) };
+    let at = |t: i64| if horiz { same(t, fixed) } else { same(fixed, t) };
+    let mut lo = pos;
+    while lo > 0 && at(lo - 1) {
+        lo -= 1;
+    }
+    let mut hi = pos;
+    while hi + 1 < len && at(hi + 1) {
+        hi += 1;
+    }
+    Some((lo as u32, hi as u32 + 1, fixed as u32))
+}
+
+unsafe fn paint_ruler(e: &Ed, dc: HDC) {
+    let Some(horiz) = e.ruler else { return };
+    let Some((lo, hi, fixed)) = ruler_span(e, horiz) else { return };
+    let f = fixed as f32 + 0.5;
+    let (a, b) = if horiz { (to_client(e, lo as f32, f), to_client(e, hi as f32, f)) } else { (to_client(e, f, lo as f32), to_client(e, f, hi as f32)) };
+    let pen = CreatePen(PS_SOLID, 1, rgb(0xFF3B30));
+    let op = SelectObject(dc, pen);
+    MoveToEx(dc, a.0, a.1, null_mut());
+    LineTo(dc, b.0, b.1);
+    let t = 5;
+    for p in [a, b] {
+        if horiz {
+            MoveToEx(dc, p.0, p.1 - t, null_mut());
+            LineTo(dc, p.0, p.1 + t + 1);
+        } else {
+            MoveToEx(dc, p.0 - t, p.1, null_mut());
+            LineTo(dc, p.0 + t + 1, p.1);
+        }
+    }
+    SelectObject(dc, op);
+    DeleteObject(pen);
+    let k = if e.pt_units { e.scale.0 } else { 1.0 };
+    let label = format!(" {} {} ", ((hi - lo) as f32 / k).round(), if e.pt_units { "pt" } else { "px" });
+    let f = ui_font((12.0 * dpi(e)) as i32, true);
+    let of = SelectObject(dc, f);
+    let tw = text_w(dc, &label);
+    let th = (18.0 * dpi(e)) as i32;
+    let (cx, cy) = ((a.0 + b.0) / 2, (a.1 + b.1) / 2);
+    let lr = if horiz { RECT { left: cx - tw / 2, top: cy - th - 6, right: cx + tw / 2 + 1, bottom: cy - 6 } } else { RECT { left: cx + 8, top: cy - th / 2, right: cx + 8 + tw, bottom: cy + th / 2 } };
+    fill(dc, &lr, 0xFF3B30);
+    draw_text(dc, &label, &lr, 0xFFFFFF, DT_LEFT);
+    SelectObject(dc, of);
+    DeleteObject(f);
 }
 
 unsafe fn paint_selection(e: &Ed, dc: HDC) {
@@ -694,22 +819,56 @@ unsafe fn paint_toolbar(e: &mut Ed, dc: HDC, cw: i32) {
     let (top, bot) = (pad, tb - pad);
     let mut x = pad;
     e.layout.clear();
+    // Right side first (Done must never be pushed out): undo, save, done.
+    let mut rx = cw - pad;
+    let narrow = cw < (1500.0 * u) as i32;
+    let right: [(&str, Item, bool); 3] = if narrow {
+        [("완료", Item::Done, true), ("저장", Item::Save, false), ("되돌리기", Item::Undo, false)]
+    } else {
+        [("완료 · 복사  Esc", Item::Done, true), ("저장  Ctrl+S", Item::Save, false), ("되돌리기", Item::Undo, false)]
+    };
+    for (label, item, accent) in right {
+        let w = text_w(dc, label) + (20.0 * u) as i32;
+        let r = RECT { left: rx - w, top, right: rx, bottom: bot };
+        fill(dc, &r, if accent { 0x1E6FD9 } else { 0x3A3A3A });
+        draw_text(dc, label, &r, 0xFFFFFF, DT_CENTER);
+        e.layout.push((r, item));
+        rx -= w + (6.0 * u) as i32;
+    }
+    let limit = rx - pad;
+    // Tools: "K 이름", or just the key letter when the window is too narrow for the names.
+    let full: i32 = TOOLS
+        .iter()
+        .map(|(_, k, n)| {
+            SelectObject(dc, fk);
+            let kw = text_w(dc, &k.to_string());
+            SelectObject(dc, f);
+            text_w(dc, n) + kw + (18.0 * u) as i32
+        })
+        .sum();
+    let rest = (8 * 30 + 3 * 30 + 90) as f32 * u; // colours, sizes, tail toggle
+    let compact = x + full + rest as i32 > limit;
     for (t, key, name) in TOOLS {
         SelectObject(dc, fk);
         let kw = text_w(dc, &key.to_string());
         SelectObject(dc, f);
-        let w = text_w(dc, name) + kw + (16.0 * u) as i32;
+        let w = if compact { kw + (16.0 * u) as i32 } else { text_w(dc, name) + kw + (16.0 * u) as i32 };
         let r = RECT { left: x, top, right: x + w, bottom: bot };
         if e.tool == t {
             fill(dc, &r, 0x4A4A4A);
             fill(dc, &RECT { left: r.left, top: r.bottom - (2.0 * u) as i32, right: r.right, bottom: r.bottom }, 0x3DA5FF);
         }
-        let inner = RECT { left: r.left + (6.0 * u) as i32, ..r };
         SelectObject(dc, fk);
-        draw_text(dc, &key.to_string(), &inner, 0x8A8A8A, DT_LEFT);
+        if compact {
+            draw_text(dc, &key.to_string(), &r, if e.tool == t { 0xFFFFFF } else { 0xC8C8C8 }, DT_CENTER);
+        } else {
+            let inner = RECT { left: r.left + (6.0 * u) as i32, ..r };
+            draw_text(dc, &key.to_string(), &inner, 0x8A8A8A, DT_LEFT);
+            SelectObject(dc, f);
+            let inner = RECT { left: inner.left + kw + (4.0 * u) as i32, ..r };
+            draw_text(dc, name, &inner, 0xF0F0F0, DT_LEFT);
+        }
         SelectObject(dc, f);
-        let inner = RECT { left: inner.left + kw + (4.0 * u) as i32, ..r };
-        draw_text(dc, name, &inner, 0xF0F0F0, DT_LEFT);
         e.layout.push((r, Item::Tool(t)));
         x += w + (2.0 * u) as i32;
     }
@@ -717,6 +876,9 @@ unsafe fn paint_toolbar(e: &mut Ed, dc: HDC, cw: i32) {
     let cur = if e.tool == Tool::Highlight { e.hl_color } else { e.color };
     let sw = (bot - top) - (6.0 * u) as i32;
     for c in COLORS.iter().copied().chain((e.tool == Tool::Highlight).then_some(HL_DEFAULT)) {
+        if x + sw > limit {
+            break;
+        }
         let r = RECT { left: x, top: top + (3.0 * u) as i32, right: x + sw, bottom: top + (3.0 * u) as i32 + sw };
         if c == cur {
             fill(dc, &RECT { left: r.left - 3, top: r.top - 3, right: r.right + 3, bottom: r.bottom + 3 }, 0xF0F0F0);
@@ -728,6 +890,9 @@ unsafe fn paint_toolbar(e: &mut Ed, dc: HDC, cw: i32) {
     x += (8.0 * u) as i32;
     for s in 0..3u8 {
         let r = RECT { left: x, top, right: x + sw + (4.0 * u) as i32, bottom: bot };
+        if r.right > limit {
+            break;
+        }
         if e.size == s {
             fill(dc, &r, 0x4A4A4A);
         }
@@ -748,6 +913,9 @@ unsafe fn paint_toolbar(e: &mut Ed, dc: HDC, cw: i32) {
         let label = if on { "꼬리 켬" } else { "꼬리 끔" };
         let w = text_w(dc, label) + (20.0 * u) as i32;
         let r = RECT { left: x, top, right: x + w, bottom: bot };
+        if r.right > limit {
+            return finish_toolbar(dc, of, f, fk);
+        }
         fill(dc, &r, if on { 0x4A4A4A } else { 0x333333 });
         if on {
             fill(dc, &RECT { left: r.left, top: r.bottom - (2.0 * u) as i32, right: r.right, bottom: r.bottom }, 0x3DA5FF);
@@ -756,19 +924,11 @@ unsafe fn paint_toolbar(e: &mut Ed, dc: HDC, cw: i32) {
         e.layout.push((r, Item::Tail));
         x += w;
     }
-    // Right side: undo, save, done.
-    let mut rx = cw - pad;
-    for (label, item, accent) in [("완료 · 복사  Esc", Item::Done, true), ("저장  Ctrl+S", Item::Save, false), ("되돌리기", Item::Undo, false)] {
-        let w = text_w(dc, label) + (20.0 * u) as i32;
-        let r = RECT { left: rx - w, top, right: rx, bottom: bot };
-        if r.left < x + pad {
-            break;
-        }
-        fill(dc, &r, if accent { 0x1E6FD9 } else { 0x3A3A3A });
-        draw_text(dc, label, &r, 0xFFFFFF, DT_CENTER);
-        e.layout.push((r, item));
-        rx -= w + (6.0 * u) as i32;
-    }
+    let _ = x;
+    finish_toolbar(dc, of, f, fk);
+}
+
+unsafe fn finish_toolbar(dc: HDC, of: HGDIOBJ, f: HFONT, fk: HFONT) {
     SelectObject(dc, of);
     DeleteObject(f);
     DeleteObject(fk);
@@ -785,7 +945,13 @@ unsafe fn paint_status(e: &Ed, dc: HDC, cw: i32, ch: i32) {
         Some((x0, y0, x1, y1)) => (x1 - x0, y1 - y0),
         None => (e.base.w, e.base.h),
     };
-    let mut left = format!("{w} × {h}   {}%", (e.zoom * 100.0).round());
+    let (w, h) = if e.pt_units { ((w as f32 / e.scale.0).round() as u32, (h as f32 / e.scale.0).round() as u32) } else { (w, h) };
+    let unit = if e.pt_units { "pt" } else { "px" };
+    let mut left = format!("{w} × {h} {unit}   {}%", (e.zoom * 100.0).round());
+    if let Some(c) = e.area {
+        let (aw, ah) = area_size(e, c);
+        left += &format!("   선택 {aw} × {ah}");
+    }
     if let Some((x, y)) = e.hover.filter(|&(x, y)| x >= 0.0 && y >= 0.0 && x < e.base.w as f32 && y < e.base.h as f32) {
         left += &format!("   ({}, {})", x as u32, y as u32);
     }
@@ -795,10 +961,11 @@ unsafe fn paint_status(e: &Ed, dc: HDC, cw: i32, ch: i32) {
     }
     let lr = RECT { left: (10.0 * u) as i32, ..r };
     draw_text(dc, &left, &lr, 0xC8C8C8, DT_LEFT);
-    let hint = if e.editing_text {
-        "입력 중 · Enter 끝내기 · Shift+Enter 줄바꿈"
-    } else {
-        "Ctrl+Z 되돌리기 · Del 삭제 · Tab 색상 복사 · 휠 이동 · Ctrl+휠 확대 · 0 원래 크기 · 1 맞춤"
+    let hint = match ctx(e) {
+        Ctx::Text => "입력 중 · Enter 끝내기 · Shift+Enter 줄바꿈",
+        Ctx::Area => "R 사각형 · O 원 · B 흐림 · S 강조 · M 돋보기 · Del 지우기 · 화살표 이동 · Ctrl+화살표 크기 · [ ] 줄이기/늘리기 · C 평균색 · A 맞춤 · Enter 자르기 · Ctrl+C 복사 · Ctrl+O 텍스트 · Esc 해제",
+        Ctx::Object => "Tab 다음 · 화살표 이동 · Ctrl+D 복제 · Ctrl+[ ] 크기 · Ctrl+C/V 복사·붙여넣기 · Del 삭제 · Esc 선택 해제",
+        _ => "V 드래그 = 영역 선택 · Tab 색상 · Shift+Tab 가장 어두운 색 · 화살표/1/2 누르고 재기 · Ctrl+O 텍스트 · Ctrl+Z 되돌리기 · Ctrl+1 맞춤 · Ctrl+0 원래 크기",
     };
     let rr = RECT { right: cw - (10.0 * u) as i32, ..r };
     draw_text(dc, hint, &rr, 0x8A8A8A, DT_RIGHT);
@@ -822,7 +989,9 @@ fn new_shape(e: &Ed, p: (f32, f32)) -> Option<Shape> {
         Tool::Highlight => Shape::Highlight,
         Tool::Blur => Shape::Blur,
         Tool::Erase => Shape::Erase,
-        Tool::Text | Tool::Counter | Tool::Crop => return None,
+        Tool::Spotlight => Shape::Spotlight,
+        Tool::Magnifier => Shape::Magnifier(p),
+        Tool::Select | Tool::Text | Tool::Counter => return None,
     })
 }
 
@@ -972,12 +1141,6 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
         }
         commit_live(e);
     }
-    if e.tool == Tool::Crop {
-        e.drag = Drag::Crop { start: p };
-        e.live_crop = Some((p.0, p.1, p.0, p.1));
-        SetCapture(e.hwnd);
-        return After::Nothing;
-    }
     // Tail tip of a speech bubble: drag it (back into the box removes the tail).
     let tip_tol = 8.0 / e.zoom;
     if let Some(i) = (0..e.objs.len()).rev().find(|&i| {
@@ -996,8 +1159,18 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
             (&o.shape, e.tool),
             (Shape::Blur, Tool::Blur) | (Shape::Erase, Tool::Erase) | (Shape::Highlight, Tool::Highlight)
         );
-        if same { o.hit(e.scale, p.0, p.1, tol) } else { o.hit_edge(e.scale, p.0, p.1, tol) }
+        if same || e.tool == Tool::Select { o.hit(e.scale, p.0, p.1, tol) } else { o.hit_edge(e.scale, p.0, p.1, tol) }
     };
+    // Select tool: a drag inside the area selection moves it.
+    if e.tool == Tool::Select {
+        if let Some(c) = e.area.filter(|c| p.0 >= c.0.min(c.2) && p.0 <= c.0.max(c.2) && p.1 >= c.1.min(c.3) && p.1 <= c.1.max(c.3)) {
+            e.area = Some(norm(c));
+            e.drag = Drag::AreaMove { last: p };
+            SetCapture(e.hwnd);
+            return After::Nothing;
+        }
+    }
+    e.area = None;
     if let Some(i) = (0..e.objs.len()).rev().find(|&i| grabs(&e.objs[i])) {
         let is_text = matches!(e.objs[i].shape, Shape::Text(_));
         lift(e, i);
@@ -1014,6 +1187,13 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
     e.sel = None;
     let (color, size) = (cur_color(e), e.size);
     match e.tool {
+        Tool::Select => {
+            let (w, h) = (e.base.w as f32, e.base.h as f32);
+            let q = (p.0.clamp(0.0, w), p.1.clamp(0.0, h));
+            e.drag = Drag::Area { start: q };
+            e.area = Some((q.0, q.1, q.0, q.1));
+            SetCapture(e.hwnd);
+        }
         Tool::Text => {
             snapshot(e);
             let px = e.scale.font_px(size);
@@ -1071,6 +1251,9 @@ unsafe fn on_move(e: &mut Ed, x: i32, y: i32) {
                     }
                     _ => o.b = b,
                 }
+                if let Shape::Magnifier(c) = &mut o.shape {
+                    *c = annot::place_lens((o.a.0, o.a.1, o.b.0, o.b.1), e.base.w, e.base.h);
+                }
             }
             draw_live(e);
         }
@@ -1095,13 +1278,22 @@ unsafe fn on_move(e: &mut Ed, x: i32, y: i32) {
             }
             draw_live(e);
         }
-        Drag::Crop { start } => {
+        Drag::Area { start } => {
             let b = constrain(e, start, p);
             let (w, h) = (e.base.w as f32, e.base.h as f32);
-            e.live_crop = Some((start.0.clamp(0.0, w), start.1.clamp(0.0, h), b.0.clamp(0.0, w), b.1.clamp(0.0, h)));
+            e.area = Some((start.0, start.1, b.0.clamp(0.0, w), b.1.clamp(0.0, h)));
+        }
+        Drag::AreaMove { last } => {
+            if let Some(c) = e.area {
+                let (w, h) = (e.base.w as f32, e.base.h as f32);
+                let dx = (p.0 - last.0).clamp(-c.0, w - c.2);
+                let dy = (p.1 - last.1).clamp(-c.1, h - c.3);
+                e.area = Some((c.0 + dx, c.1 + dy, c.2 + dx, c.3 + dy));
+                e.drag = Drag::AreaMove { last: (last.0 + dx, last.1 + dy) };
+            }
         }
     }
-    if e.drag == Drag::None {
+    if e.drag == Drag::None && e.ruler.is_none() {
         // Hover only changes the coordinates in the status bar.
         let mut rc: RECT = zeroed();
         GetClientRect(e.hwnd, &mut rc);
@@ -1147,107 +1339,343 @@ unsafe fn on_up(e: &mut Ed) {
             commit_live(e);
         }
         Drag::TextTail { .. } => {} // keep typing into the new text box
-        Drag::Crop { .. } => {
-            if let Some(c) = e.live_crop.take().filter(|&c| clip_rect(c, e.base.w, e.base.h).is_some()) {
-                snapshot(e);
-                e.crop = Some(c);
-            }
+        Drag::Area { .. } => {
+            // A click (no real drag) clears the selection.
+            e.area = e.area.filter(|&c| clip_rect(c, e.base.w, e.base.h).is_some()).map(norm);
         }
         _ => {}
     }
     InvalidateRect(e.hwnd, null(), 0);
 }
 
-unsafe fn copy_color(e: &mut Ed) {
-    let Some((x, y)) = e.hover else { return };
-    if x < 0.0 || y < 0.0 || x >= e.base.w as f32 || y >= e.base.h as f32 {
+fn norm(c: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    (c.0.min(c.2), c.1.min(c.3), c.0.max(c.2), c.1.max(c.3))
+}
+
+fn hex(p: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", p[0], p[1], p[2])
+}
+
+unsafe fn copy_hex(e: &mut Ed, p: [u8; 3], what: &str) {
+    let h = hex(p);
+    e.status = if crate::clip::write_text(e.hwnd, &h) { format!("{what} {h} 복사함") } else { "복사 실패".into() };
+}
+
+fn pixel(e: &Ed, x: usize, y: usize) -> [u8; 3] {
+    let i = (y * e.base.w as usize + x) * 4;
+    [e.work.px[i], e.work.px[i + 1], e.work.px[i + 2]]
+}
+
+fn hover_px(e: &Ed) -> Option<(usize, usize)> {
+    let (x, y) = e.hover?;
+    (x >= 0.0 && y >= 0.0 && x < e.base.w as f32 && y < e.base.h as f32).then_some((x as usize, y as usize))
+}
+
+/// Tab: colour under the cursor. Shift+Tab: darkest pixel of the 20×20 box around it (Shottr
+/// samples cursor−10 … cursor+10, which picks text colour over anti-aliased edges).
+unsafe fn copy_color(e: &mut Ed, darkest: bool) {
+    let Some((x, y)) = hover_px(e) else { return };
+    if !darkest {
+        let p = pixel(e, x, y);
+        return copy_hex(e, p, "색상");
+    }
+    let p = keymap::darkest(&e.work.px, e.base.w as usize, e.base.h as usize, x, y);
+    copy_hex(e, p, "가장 어두운 색");
+}
+
+fn area_px(e: &Ed) -> Option<(u32, u32, u32, u32)> {
+    e.area.and_then(|c| clip_rect(c, e.base.w, e.base.h))
+}
+
+/// C with an area: its average colour.
+unsafe fn copy_avg(e: &mut Ed) {
+    let Some((x0, y0, x1, y1)) = area_px(e) else { return };
+    let mut sum = [0u64; 3];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = pixel(e, x as usize, y as usize);
+            (0..3).for_each(|k| sum[k] += p[k] as u64);
+        }
+    }
+    let n = ((x1 - x0) * (y1 - y0)) as u64;
+    let p = [0, 1, 2].map(|k| ((sum[k] + n / 2) / n) as u8);
+    copy_hex(e, p, "평균색");
+}
+
+/// A with an area: shrink it to the content (edges that are one flat colour are dropped).
+fn auto_adjust(e: &mut Ed) {
+    let Some((mut x0, mut y0, mut x1, mut y1)) = area_px(e) else { return };
+    let bg = pixel(e, x0 as usize, y0 as usize);
+    let flat = |e: &Ed, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
+        ys.clone().all(|y| xs.clone().all(|x| pixel(e, x as usize, y as usize).iter().zip(bg).all(|(a, b)| a.abs_diff(b) <= 16)))
+    };
+    while y1 - y0 > 2 && flat(e, x0..x1, y0..y0 + 1) {
+        y0 += 1;
+    }
+    while y1 - y0 > 2 && flat(e, x0..x1, y1 - 1..y1) {
+        y1 -= 1;
+    }
+    while x1 - x0 > 2 && flat(e, x0..x0 + 1, y0..y1) {
+        x0 += 1;
+    }
+    while x1 - x0 > 2 && flat(e, x1 - 1..x1, y0..y1) {
+        x1 -= 1;
+    }
+    if (x1 - x0, y1 - y0) == (2, 2) || (y1 - y0 <= 2 && flat(e, x0..x1, y0..y1)) {
+        e.status = "내용이 없는 영역".into();
+        return; // all one colour: keep the selection
+    }
+    e.area = Some((x0 as f32, y0 as f32, x1 as f32, y1 as f32));
+}
+
+/// Pixels of the edited picture inside `r`, as RGBA.
+fn region(e: &Ed, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> Rgba {
+    let w = (x1 - x0) as usize;
+    let mut px = Vec::with_capacity(w * (y1 - y0) as usize * 4);
+    for y in y0..y1 {
+        let o = (y as usize * e.base.w as usize + x0 as usize) * 4;
+        px.extend_from_slice(&e.work.px[o..o + w * 4]);
+    }
+    Rgba { w: w as u32, h: y1 - y0, px }
+}
+
+/// Ctrl+C with an area: copy just that part (the editor stays open).
+unsafe fn copy_area(e: &mut Ed) {
+    let Some(r) = area_px(e) else { return };
+    let img = region(e, r);
+    let ok = crate::optimize::encode_png(&img).ok().is_some_and(|png| {
+        let dib = crate::optimize::encode_dib(&img);
+        let out = crate::clip::Output { id: "editor-area", png: &png, dib: &dib, path: std::path::Path::new(""), with_path: false };
+        crate::clip::write(e.hwnd, &out, None)
+    });
+    e.status = if ok { format!("선택 영역 {} × {} 복사함", img.w, img.h) } else { "복사 실패".into() };
+}
+
+/// Ctrl+O: text recognition of the area (or the whole picture) on a worker thread.
+unsafe fn start_ocr(e: &mut Ed) {
+    let r = area_px(e).unwrap_or((0, 0, e.base.w, e.base.h));
+    let img = region(e, r);
+    let mut bgra = img.px;
+    bgra.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+    let (w, h, dpi) = (img.w as i32, img.h as i32, (96.0 * e.scale.0) as u32);
+    let hwnd = e.hwnd as usize;
+    e.status = "텍스트 인식 중…".into();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(|| crate::ocr::recognize(w, h, &bgra, dpi)).unwrap_or_else(|_| Err("내부 오류(panic)".into()));
+        *OCR_OUT.lock().unwrap() = Some(r);
+        unsafe { PostMessageW(hwnd as HWND, WM_EDITOR_OCR, 0, 0) };
+    });
+}
+
+unsafe fn ocr_done(e: &mut Ed) {
+    let Some(r) = OCR_OUT.lock().unwrap().take() else { return };
+    e.status = match r {
+        Ok(t) if t.trim().is_empty() => "인식된 텍스트가 없습니다".into(),
+        Ok(t) if crate::clip::write_text(e.hwnd, &t) => format!("텍스트 {}줄 {}자 복사함", t.lines().count(), t.chars().count()),
+        Ok(_) => "복사 실패".into(),
+        Err(err) => format!("텍스트 인식 실패: {err}"),
+    };
+}
+
+/// Turns the area selection into an object (Shottr: R / O / B / S / M / Delete on a selection).
+fn area_into(e: &mut Ed, t: Tool) {
+    let Some(c) = e.area.take().map(norm) else { return };
+    let shape = match t {
+        Tool::Rect => Shape::Rect,
+        Tool::Oval => Shape::Oval,
+        Tool::Blur => Shape::Blur,
+        Tool::Erase => Shape::Erase,
+        Tool::Spotlight => Shape::Spotlight,
+        Tool::Magnifier => Shape::Magnifier(annot::place_lens(c, e.base.w, e.base.h)),
+        _ => return,
+    };
+    let o = Obj { shape, a: (c.0, c.1), b: (c.2, c.3), color: e.color, size: e.size, tail: true };
+    if o.degenerate() {
         return;
     }
-    let i = ((y as usize) * e.base.w as usize + x as usize) * 4;
-    let p = &e.work.px[i..i + 3];
-    let hex = format!("#{:02X}{:02X}{:02X}", p[0], p[1], p[2]);
-    e.status = if crate::clip::write_text(e.hwnd, &hex) { format!("{hex} 복사함") } else { "복사 실패".into() };
+    snapshot(e);
+    e.objs.push(o);
+    e.sel = None;
+    rebuild(e);
+}
+
+unsafe fn zoom_to(e: &mut Ed, r: (f32, f32, f32, f32)) {
+    let r = norm(r);
+    let (rw, rh) = ((r.2 - r.0).max(1.0), (r.3 - r.1).max(1.0));
+    let c = canvas(e);
+    let (cw, ch) = ((c.right - c.left) as f32, (c.bottom - c.top) as f32);
+    e.zoom = (cw / rw).min(ch / rh).mul_add(0.9, 0.0).clamp(0.05, 16.0);
+    e.ox = c.left as f32 + cw / 2.0 - (r.0 + rw / 2.0) * e.zoom;
+    e.oy = c.top as f32 + ch / 2.0 - (r.1 + rh / 2.0) * e.zoom;
+    e.fit = false;
+    clamp_view(e, false);
+}
+
+fn ctx(e: &Ed) -> Ctx {
+    if e.editing_text {
+        Ctx::Text
+    } else if matches!(e.drag, Drag::Draw | Drag::TextTail { .. }) {
+        Ctx::Drawing
+    } else if e.area.is_some() {
+        Ctx::Area
+    } else if e.sel.is_some() {
+        Ctx::Object
+    } else {
+        Ctx::None
+    }
+}
+
+/// Esc during a move / area drag / pan: put things back.
+unsafe fn cancel_drag(e: &mut Ed) {
+    let drag = std::mem::replace(&mut e.drag, Drag::None);
+    ReleaseCapture();
+    match drag {
+        Drag::Area { .. } => e.area = None,
+        Drag::Move { .. } | Drag::Tip => commit_live(e),
+        _ => {}
+    }
 }
 
 unsafe fn on_key(e: &mut Ed, vk: u32) -> After {
-    let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
-    let shift = GetKeyState(VK_SHIFT as i32) < 0;
-    if e.editing_text {
-        match vk {
-            0x0D if !shift => commit_live(e), // Enter
-            0x1B => commit_live(e),           // Esc
-            _ => return After::Nothing,       // characters arrive as WM_CHAR
-        }
+    let m = Mods {
+        shift: GetKeyState(VK_SHIFT as i32) < 0,
+        ctrl: GetKeyState(VK_CONTROL as i32) < 0,
+        alt: GetKeyState(VK_MENU as i32) < 0,
+    };
+    let key = Key::from_vk(vk);
+    if key == Key::Esc && !matches!(e.drag, Drag::None | Drag::Draw | Drag::TextTail { .. }) {
+        cancel_drag(e);
         InvalidateRect(e.hwnd, null(), 0);
         return After::Nothing;
     }
-    if ctrl {
-        match vk {
-            0x5A if shift => undo(e, true), // Ctrl+Shift+Z
-            0x5A => undo(e, false),
-            0x59 => undo(e, true), // Ctrl+Y
-            0x43 => return After::Finish,
-            0x53 => return After::SaveAs,
-            0x30 | 0x60 => zoom_at_center(e, 1.0),
-            0xBB | 0x6B => zoom_step(e, true),
-            0xBD | 0x6D => zoom_step(e, false),
-            _ => {}
-        }
-        InvalidateRect(e.hwnd, null(), 0);
-        return After::Nothing;
-    }
-    match vk {
-        0x1B => {
-            if e.drag != Drag::None {
-                // Cancel the drag in progress.
-                e.drag = Drag::None;
-                ReleaseCapture();
-                e.live_crop = None;
-                if e.live_at.is_none() && e.live.take().is_some() {
-                    e.undo.pop();
-                    draw_live(e);
-                } else {
-                    commit_live(e);
-                }
-            } else if e.sel.take().is_none() {
-                return After::Finish;
+    let act = keymap::action(key, m, ctx(e));
+    let after = run(e, act);
+    InvalidateRect(e.hwnd, null(), 0);
+    after
+}
+
+unsafe fn run(e: &mut Ed, act: Act) -> After {
+    let unit = if e.pt_units { e.scale.0 } else { 1.0 };
+    let (w, h) = (e.base.w as f32, e.base.h as f32);
+    match act {
+        Act::Tool(t) => set_tool(e, t),
+        Act::AreaInto(t) => area_into(e, t),
+        Act::AreaErase => area_into(e, Tool::Erase),
+        Act::AreaMove(..) | Act::AreaResize(..) | Act::AreaGrow(_) => {
+            if let Some(c) = e.area {
+                e.area = Some(keymap::area_apply(c, act, unit, w, h));
             }
         }
-        0x0D => return After::Finish,
-        VK_DELETE_U | VK_BACK_U => {
+        Act::AreaAvgColor => copy_avg(e),
+        Act::AreaAutoAdjust => auto_adjust(e),
+        Act::AreaCrop => {
+            if let Some(c) = e.area.take().filter(|&c| clip_rect(c, e.base.w, e.base.h).is_some()) {
+                snapshot(e);
+                e.crop = Some(norm(c));
+            }
+        }
+        Act::AreaClear => e.area = None,
+        Act::AreaCopy => copy_area(e),
+        Act::AreaOcr | Act::Ocr => start_ocr(e),
+        Act::ColorPixel => copy_color(e, false),
+        Act::ColorDarkest => copy_color(e, true),
+        Act::ObjNext => {
+            if !e.objs.is_empty() {
+                e.sel = Some(e.sel.map_or(0, |i| (i + 1) % e.objs.len()));
+            }
+        }
+        Act::ObjDelete => {
             if let Some(i) = e.sel.take() {
                 snapshot(e);
                 e.objs.remove(i);
                 rebuild(e);
             }
         }
-        0x09 => copy_color(e),
-        0x20 => e.space = true,
-        0x25..=0x28 => {
-            if let Some(i) = e.sel {
-                let d = if shift { 10.0 } else { 1.0 };
-                let (dx, dy) = [(-d, 0.0), (0.0, -d), (d, 0.0), (0.0, d)][(vk - 0x25) as usize];
+        Act::ObjDuplicate => {
+            if let Some(mut o) = e.sel.and_then(|i| e.objs.get(i)).cloned() {
                 snapshot(e);
-                e.objs[i].translate(dx, dy);
+                o.translate(10.0, 10.0);
+                e.objs.push(o);
+                e.sel = Some(e.objs.len() - 1);
                 rebuild(e);
             }
         }
-        0xBB | 0x6B => zoom_step(e, true),
-        0xBD | 0x6D => zoom_step(e, false),
-        0x30 | 0x60 => zoom_at_center(e, 1.0),
-        0x31 | 0x61 => fit_view(e),
-        _ => {
-            if let Some(&(t, _, _)) = TOOLS.iter().find(|(_, k, _)| *k as u32 == vk) {
-                set_tool(e, t);
+        Act::ObjSize(d) => {
+            if let Some(i) = e.sel {
+                let s = (e.objs[i].size as i8 + d).clamp(0, 2) as u8;
+                if s != e.objs[i].size {
+                    snapshot(e);
+                    e.objs[i].size = s;
+                    e.size = s;
+                    rebuild(e);
+                }
             }
         }
+        Act::ObjCopy => {
+            if let Some(o) = e.sel.and_then(|i| e.objs.get(i)).cloned() {
+                OBJ_CLIP.with(|c| *c.borrow_mut() = Some(o));
+                e.status = "개체 복사함 (Ctrl+V 붙여넣기)".into();
+            }
+        }
+        Act::ObjPaste => {
+            let Some(mut o) = OBJ_CLIP.with(|c| c.borrow().clone()) else { return After::Nothing };
+            o.translate(10.0, 10.0);
+            OBJ_CLIP.with(|c| *c.borrow_mut() = Some(o.clone())); // next paste lands further on
+            commit_live(e);
+            snapshot(e);
+            e.objs.push(o);
+            e.sel = Some(e.objs.len() - 1);
+            e.area = None;
+            rebuild(e);
+        }
+        Act::ObjNudge(dx, dy) => {
+            if let Some(i) = e.sel {
+                snapshot(e);
+                e.objs[i].translate(dx as f32 * unit, dy as f32 * unit);
+                rebuild(e);
+            }
+        }
+        Act::ObjDeselect => e.sel = None,
+        Act::CopyImage | Act::Finish => return After::Finish,
+        Act::DrawFinish => {
+            if e.drag == Drag::Draw {
+                on_up(e);
+            }
+        }
+        Act::TextCommit => commit_live(e),
+        Act::TextInput | Act::Nothing => {}
+        Act::Undo => undo(e, false),
+        Act::Redo => undo(e, true),
+        Act::Save | Act::SaveAs => return After::SaveAs,
+        Act::Units => {
+            e.pt_units = !e.pt_units;
+            e.status = if e.pt_units { "단위: pt (화면 배율 반영)".into() } else { "단위: px".into() };
+        }
+        Act::Pin | Act::AddCapture | Act::Upload | Act::Rasterize | Act::Backdrop => {
+            e.status = "ShotClip에서 아직 지원하지 않는 Shottr 기능".into();
+        }
+        Act::ZoomIn => zoom_step(e, true),
+        Act::ZoomOut => zoom_step(e, false),
+        Act::ZoomFit => fit_view(e),
+        Act::Zoom100 => zoom_at_center(e, 1.0),
+        Act::ZoomSelection => {
+            let r = e.area.or_else(|| e.sel.and_then(|i| e.objs.get(i)).map(|o| o.bounds(e.scale)));
+            if let Some(r) = r {
+                zoom_to(e, r);
+            }
+        }
+        Act::CornerTopLeft | Act::CornerBottomRight => {
+            if let Some(p) = hover_px(e).map(|(x, y)| (x as f32, y as f32)) {
+                let c = e.area.map(norm).unwrap_or((p.0, p.1, p.0, p.1));
+                e.area = Some(if act == Act::CornerTopLeft { (p.0, p.1, c.2.max(p.0), c.3.max(p.1)) } else { (c.0.min(p.0), c.1.min(p.1), p.0 + 1.0, p.1 + 1.0) });
+                e.sel = None;
+            }
+        }
+        Act::Ruler(horiz) => e.ruler = Some(horiz),
+        Act::Pan => e.space = true,
     }
-    InvalidateRect(e.hwnd, null(), 0);
     After::Nothing
 }
-
-const VK_DELETE_U: u32 = 0x2E;
-const VK_BACK_U: u32 = 0x08;
 
 unsafe fn zoom_at_center(e: &mut Ed, z: f32) {
     let c = canvas(e);
@@ -1418,10 +1846,20 @@ unsafe fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<(LRESUL
                 After::Nothing
             }
             WM_KEYDOWN => on_key(e, wp as u32),
+            // Alt+letter (Shottr: Opt+tool key) comes as a system key; Alt+F4 etc. stay default.
+            WM_SYSKEYDOWN if (0x41..=0x5A).contains(&(wp as u32)) => on_key(e, wp as u32),
             WM_KEYUP => {
                 if wp == 0x20 {
                     e.space = false;
                 }
+                if matches!(wp, 0x25..=0x28 | 0x31 | 0x32 | 0x61 | 0x62) && e.ruler.take().is_some() {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                After::Nothing
+            }
+            WM_EDITOR_OCR => {
+                ocr_done(e);
+                InvalidateRect(hwnd, null(), 0);
                 After::Nothing
             }
             WM_CHAR => {

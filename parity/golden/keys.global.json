@@ -1,0 +1,35 @@
+[
+  {
+    "action": "finish"
+  },
+  {
+    "action": "draw:finish"
+  },
+  {
+    "action": "copy:image"
+  },
+  {
+    "action": "undo"
+  },
+  {
+    "action": "redo"
+  },
+  {
+    "action": "save"
+  },
+  {
+    "action": "saveas"
+  },
+  {
+    "action": "ocr"
+  },
+  {
+    "action": "units"
+  },
+  {
+    "action": "text:input"
+  },
+  {
+    "action": "text:input"
+  }
+]

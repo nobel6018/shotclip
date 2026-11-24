@@ -1,0 +1,8 @@
+[
+  {
+    "action": "corner:topleft"
+  },
+  {
+    "action": "corner:bottomright"
+  }
+]

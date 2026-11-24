@@ -1,0 +1,23 @@
+[
+  {
+    "action": "zoom:in"
+  },
+  {
+    "action": "zoom:out"
+  },
+  {
+    "action": "zoom:fit"
+  },
+  {
+    "action": "zoom:100"
+  },
+  {
+    "action": "zoom:selection"
+  },
+  {
+    "action": "zoom:in"
+  },
+  {
+    "action": "zoom:out"
+  }
+]
