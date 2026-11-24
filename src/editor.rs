@@ -863,7 +863,10 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
     SetFocus(e.hwnd);
     if let Some(&(_, item)) = e.layout.iter().find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
         if button == 0 {
-            return click_item(e, item);
+            let after = click_item(e, item);
+            // Hover no longer repaints the toolbar, so show the new tool/colour/size now.
+            InvalidateRect(e.hwnd, null(), 0);
+            return after;
         }
     }
     let c = canvas(e);
