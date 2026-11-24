@@ -1,7 +1,8 @@
 //! ShotClip: screenshot tool for Windows.
 //!
 //! - Alt+Shift+3 / Alt+Shift+4: macOS-style capture (see capture.rs). Results go through the
-//!   same optimiser, onto the clipboard and (optionally) to the Desktop like macOS.
+//!   same optimiser, onto the clipboard and (optionally) to the Desktop like macOS, then the
+//!   post-capture editor opens (editor.rs, like Shottr); edits are re-exported on close.
 //! - Alt+Shift+5 scrolling capture, 6 OCR, 7 colour picker, 8 pixel ruler (Shottr-style tools,
 //!   see overlay.rs / scroll.rs / ocr.rs).
 //! - In-app updates from GitHub Releases (updater.rs).
@@ -12,8 +13,10 @@
 //!   the original. Like Clop, the keys are only grabbed while a result is "live".
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod annot;
 mod capture;
 mod clip;
+mod editor;
 mod ocr;
 mod optimize;
 mod overlay;
@@ -118,6 +121,7 @@ struct App {
     paused: bool,
     copy_path: bool,
     save_desktop: bool,
+    open_editor: bool,
     hotkeys: bool,
     update: Option<updater::Update>,
     installing: bool,
@@ -300,7 +304,11 @@ unsafe fn notify(hwnd: HWND, title: &str, body: &str) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let Some((paused, copy_path, save_desktop)) = with_app(|a| (a.paused, a.copy_path, a.save_desktop)) else { return };
+    let Some((paused, copy_path, save_desktop, open_editor)) =
+        with_app(|a| (a.paused, a.copy_path, a.save_desktop, a.open_editor))
+    else {
+        return;
+    };
     let auto = store::autostart_enabled();
     let m = CreatePopupMenu();
     let item = |id: usize, text: &str, checked: bool| {
@@ -310,6 +318,7 @@ unsafe fn show_menu(hwnd: HWND) {
     item(1, "일시정지", paused);
     item(2, "파일 경로도 복사 (Clop 기본값)", copy_path);
     item(6, "캡처를 바탕화면에도 저장 (Alt+Shift+3/4)", save_desktop);
+    item(8, "캡처 후 편집기 열기", open_editor);
     item(3, "Windows 시작 시 실행", auto);
     AppendMenuW(m, MF_SEPARATOR, 0, null());
     match with_app(|a| a.update.as_ref().map(|u| u.version.clone())).flatten() {
@@ -347,6 +356,10 @@ unsafe fn show_menu(hwnd: HWND) {
             with_app(|a| a.save_desktop = !save_desktop);
             store::set_bool("SaveToDesktop", !save_desktop);
         }
+        8 => {
+            with_app(|a| a.open_editor = !open_editor);
+            store::set_bool("OpenEditor", !open_editor);
+        }
         3 => store::set_autostart(!auto),
         7 => {
             if with_app(|a| a.update.is_some()).unwrap_or(false) {
@@ -370,14 +383,30 @@ unsafe fn show_menu(hwnd: HWND) {
 
 /// Called by capture.rs with the captured image(s); `clip_idx` is the one for the clipboard.
 pub unsafe fn on_capture(_hwnd: HWND, imgs: Vec<opt::Rgba>, clip_idx: usize) {
-    let Some((tx, save)) = with_app(|a| (a.jobs.clone(), a.save_desktop)) else { return };
+    let Some((tx, save, open_editor)) = with_app(|a| (a.jobs.clone(), a.save_desktop, a.open_editor)) else { return };
     let (dir, base, many) = (capture::desktop_dir(), capture::base_name(), imgs.len() > 1);
+    let mut edit = None;
     for (i, img) in imgs.into_iter().enumerate() {
-        let desktop = save.then(|| {
-            let name = if many { format!("{base} ({})", i + 1) } else { base.clone() };
-            capture::unique(&dir, &name)
-        });
+        let name = if many { format!("{base} ({})", i + 1) } else { base.clone() };
+        let desktop = save.then(|| capture::unique(&dir, &name));
+        if open_editor && i == clip_idx {
+            let copy = opt::Rgba { w: img.w, h: img.h, px: img.px.clone() };
+            edit = Some((copy, name, desktop.clone()));
+        }
         let _ = tx.send(Job::Capture { img, desktop, clip: i == clip_idx });
+    }
+    // Like Shottr: the original is already on its way to the clipboard/Desktop; the editor
+    // re-exports to the same file only if something was changed.
+    if let Some((img, name, desktop)) = edit {
+        let tx = tx.clone();
+        editor::open(
+            img,
+            &name,
+            false,
+            Box::new(move |img| {
+                let _ = tx.send(Job::Capture { img, desktop: desktop.clone(), clip: true });
+            }),
+        );
     }
 }
 
@@ -467,7 +496,7 @@ unsafe fn on_update_checked(hwnd: HWND, manual: bool) {
 /// Like sori: refuses while something is in progress instead of interrupting it.
 unsafe fn start_install(hwnd: HWND) {
     let Some(Some(u)) = with_app(|a| if a.installing { None } else { a.update.clone() }) else { return };
-    if overlay::is_open() || scroll::active() {
+    if overlay::is_open() || scroll::active() || editor::is_open() {
         return notify(hwnd, "업데이트 대기", "진행 중인 캡처를 끝낸 뒤 다시 눌러 주세요");
     }
     with_app(|a| a.installing = true);
@@ -580,7 +609,10 @@ unsafe fn on_done(hwnd: HWND) {
     if fresh {
         with_app(|a| a.last = Some(Last { id: d.id.clone(), original: d.original.clone(), factor: d.factor }));
     }
-    set_hotkeys(hwnd, true);
+    // While the editor is open its own Ctrl+Shift+Z (redo) must not be grabbed globally.
+    if !editor::is_open() {
+        set_hotkeys(hwnd, true);
+    }
 
     let after = d.png.len();
     let saved = if after < d.before { (d.before - after) * 100 / d.before } else { 0 };
@@ -648,7 +680,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     0
 }
 
+/// `shotclip --edit <png>`: open the editor on a file (writes "<name> 편집.png" next to it).
+unsafe fn edit_file(path: &str) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    editor::register(GetModuleHandleW(null()));
+    let src = PathBuf::from(path);
+    let Ok(img) = fs::read(&src).map_err(|e| e.to_string()).and_then(|b| opt::decode_png(&b).map_err(|e| e.to_string())) else {
+        MessageBoxW(null_mut(), wide(&format!("PNG를 열 수 없습니다: {path}")).as_ptr(), wide("ShotClip").as_ptr(), MB_ICONERROR);
+        return;
+    };
+    let stem = src.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let out = src.with_file_name(format!("{stem} 편집.png"));
+    editor::open(
+        img,
+        &stem,
+        true,
+        Box::new(move |img| {
+            if let Ok(png) = opt::encode_png(&img) {
+                let _ = fs::write(&out, png);
+            }
+        }),
+    );
+    let mut msg: MSG = zeroed();
+    while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--edit" {
+        unsafe { edit_file(&args[2]) };
+        return;
+    }
     let updated = updater::after_update(); // waits for the previous version to exit
     unsafe {
         CreateMutexW(null(), 0, wide(r"Local\ShotClip.SingleInstance").as_ptr());
@@ -670,6 +735,7 @@ fn main() {
         let fc_name = wide(scroll::FRAME_CLASS);
         fc.lpszClassName = fc_name.as_ptr();
         RegisterClassW(&fc);
+        editor::register(hinst);
         let class = wide("ShotClipWnd");
         let mut wc: WNDCLASSW = zeroed();
         wc.lpfnWndProc = Some(wndproc);
@@ -704,6 +770,7 @@ fn main() {
                 paused: store::get_bool("Paused", false),
                 copy_path: store::get_bool("CopyPath", true),
                 save_desktop: store::get_bool("SaveToDesktop", true),
+                open_editor: store::get_bool("OpenEditor", true),
                 hotkeys: false,
                 update: None,
                 installing: false,
