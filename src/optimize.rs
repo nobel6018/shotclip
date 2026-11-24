@@ -241,24 +241,34 @@ pub fn human(bytes: usize) -> String {
 mod clop_tests {
     use super::*;
 
-    /// Flat 3-colour "UI" image: the downscale re-quantised toward 3 colours must beat the original.
-    #[test]
-    fn downscale_of_flat_image_does_not_grow() {
-        let (w, h) = (400u32, 300u32);
+    fn ui_image(w: u32, h: u32) -> Rgba {
+        // Big flat panels with a few colours, like a typical app screenshot.
         let mut px = Vec::new();
         for y in 0..h {
             for x in 0..w {
-                let c: [u8; 4] = if (x / 7 + y / 5) % 3 == 0 { [20, 20, 20, 255] } else if x % 11 < 2 { [30, 120, 220, 255] } else { [250, 250, 250, 255] };
+                let c: [u8; 4] = if y < 40 { [40, 44, 52, 255] } else if x < 120 { [230, 232, 236, 255] } else if (y / 24) % 2 == 0 && x > 140 && x < 360 { [30, 120, 220, 255] } else { [255, 255, 255, 255] };
                 px.extend_from_slice(&c);
             }
         }
-        let src = Rgba { w, h, px };
-        assert_eq!(unique_colors(&src, 256), Some(3));
+        Rgba { w, h, px }
+    }
+
+    #[test]
+    fn downscale_requantises_below_the_current_result() {
+        let src = ui_image(400, 300);
+        assert_eq!(unique_colors(&src, 256), Some(4));
+        // The limit is the optimised full-size result, as on the clipboard.
         let (orig, _) = quantize_png(&src).unwrap();
+        let small = resize(&src, 0.5).unwrap();
+        let (png, pix) = shrink_below(&small, &src, orig.len()).expect("smaller downscale found");
+        assert!(png.len() < orig.len());
+        assert_eq!((pix.w, pix.h), (200, 150));
+    }
+
+    #[test]
+    fn downscale_gives_up_when_nothing_is_smaller() {
+        let src = ui_image(100, 80);
         let small = resize(&src, 0.75).unwrap();
-        if let Some((png, pix)) = shrink_below(&small, &src, orig.len()) {
-            assert!(png.len() < orig.len());
-            assert_eq!((pix.w, pix.h), (300, 225));
-        }
+        assert!(shrink_below(&small, &src, 20).is_none());
     }
 }

@@ -131,6 +131,17 @@ impl Obj {
         }
     }
 
+    /// Hit only near the outline (area objects: so you can draw inside a blur/highlight).
+    pub fn hit_edge(&self, s: Scale, x: f32, y: f32, tol: f32) -> bool {
+        match self.shape {
+            Shape::Highlight | Shape::Blur | Shape::Erase => {
+                let (x0, y0, x1, y1) = self.norm();
+                rect_dist(x, y, x0, y0, x1, y1).abs() <= tol + 2.0
+            }
+            _ => self.hit(s, x, y, tol),
+        }
+    }
+
     /// Too small to keep (a click without drag for drag-shaped tools).
     pub fn degenerate(&self) -> bool {
         match &self.shape {

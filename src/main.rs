@@ -79,7 +79,8 @@ static UPDATE_BALLOON: AtomicBool = AtomicBool::new(false);
 
 enum Job {
     Optimise { seq: u32, src: clip::Source },
-    Scale { id: String, original: PathBuf, factor: f64 },
+    /// `limit`: size of the optimised full-size result (what the downscale must beat).
+    Scale { id: String, original: PathBuf, factor: f64, limit: usize },
     Restore { id: String, original: PathBuf },
     Capture { img: opt::Rgba, desktop: Option<PathBuf>, clip: bool },
 }
@@ -90,6 +91,8 @@ enum Kind {
     Scaled,
     Restored,
     Captured,
+    /// Downscale would only grow the file: the clipboard keeps the current image.
+    Kept,
 }
 
 struct Done {
@@ -114,6 +117,8 @@ struct Last {
     id: String,
     original: PathBuf,
     factor: f64,
+    /// Bytes of the optimised full-size result.
+    size: usize,
 }
 
 struct App {
@@ -169,7 +174,7 @@ fn run(job: Job) -> opt::Result<Done> {
             let before = orig_png.len();
             compress(Kind::Optimised, Some(seq), id, original, 1.0, img, orig_png, before, path)
         }
-        Job::Scale { id, original, factor } => {
+        Job::Scale { id, original, factor, limit } => {
             let orig_png = fs::read(&original)?;
             let src = opt::decode_png(&orig_png)?;
             let img = opt::resize(&src, factor)?;
@@ -177,27 +182,19 @@ fn run(job: Job) -> opt::Result<Done> {
             let pct = (factor * 100.0).round() as u32;
             let path = store::images_dir().join(format!("screenshot_{id}_{pct}pct.png"));
             let mut d = compress(Kind::Scaled, None, id, original, factor, img, baseline, orig_png.len(), path)?;
-            // Clop: an optimiser should never grow a file. A downscaled flat screenshot can, because
-            // resampling adds anti-aliased colours; re-quantise smaller or fall back to the original.
-            if d.png.len() > orig_png.len() {
+            // Clop (downscaledPNGUnderOriginal): an optimiser should never grow a file. A downscaled
+            // flat screenshot can, because resampling adds anti-aliased colours; re-quantise toward
+            // the original's colour count, or keep what is on the clipboard now.
+            if d.png.len() > limit {
                 let small = opt::resize(&src, factor)?;
-                match opt::shrink_below(&small, &src, orig_png.len()) {
+                match opt::shrink_below(&small, &src, limit) {
                     Some((png, pix)) => {
                         fs::write(&d.path, &png)?;
                         d.dib = opt::encode_dib(&pix);
                         d.png = png;
                         d.kept_original = false;
                     }
-                    None => {
-                        d.kind = Kind::Restored;
-                        d.factor = 1.0;
-                        d.dib = opt::encode_dib(&src);
-                        d.w = src.w;
-                        d.h = src.h;
-                        d.path = d.original.clone();
-                        d.png = orig_png;
-                        d.kept_original = true;
-                    }
+                    None => d.kind = Kind::Kept,
                 }
             }
             Ok(d)
@@ -423,6 +420,9 @@ pub unsafe fn on_capture(_hwnd: HWND, imgs: Vec<opt::Rgba>, clip_idx: usize) {
     // Like Shottr: the original is already on its way to the clipboard/Desktop; the editor
     // re-exports to the same file only if something was changed.
     if let Some((img, name, desktop)) = edit {
+        // Ctrl+Shift+Z / Ctrl+Shift+- of an earlier result must not stay grabbed globally while
+        // the editor (with its own Ctrl+Shift+Z = redo) is open.
+        set_hotkeys(_hwnd, false);
         let tx = tx.clone();
         editor::open(
             img,
@@ -582,8 +582,8 @@ unsafe fn on_debounce(hwnd: HWND) {
 }
 
 unsafe fn on_hotkey(hwnd: HWND, which: i32) {
-    let Some((id, original, factor, tx)) = with_app(|a| {
-        a.last.as_ref().map(|l| (l.id.clone(), l.original.clone(), l.factor, a.jobs.clone()))
+    let Some((id, original, factor, limit, tx)) = with_app(|a| {
+        a.last.as_ref().map(|l| (l.id.clone(), l.original.clone(), l.factor, l.size, a.jobs.clone()))
     })
     .flatten() else {
         return;
@@ -597,7 +597,7 @@ unsafe fn on_hotkey(hwnd: HWND, which: i32) {
         if f >= factor {
             return; // already at the 10 % floor
         }
-        (Job::Scale { id, original, factor: f }, f)
+        (Job::Scale { id, original, factor: f, limit }, f)
     } else {
         (Job::Restore { id, original }, 1.0)
     };
@@ -620,6 +620,9 @@ unsafe fn on_done(hwnd: HWND) {
     if !d.clip {
         return; // extra monitor of a full-screen capture: file only
     }
+    if d.kind == Kind::Kept {
+        return notify(hwnd, "축소하지 않음", "줄이면 오히려 파일이 커져서 지금 이미지를 그대로 둡니다");
+    }
     // Downscale/restore results only apply if the clipboard still holds this result.
     let fresh = matches!(d.kind, Kind::Optimised | Kind::Captured);
     if !fresh && clip::marker_id(hwnd).as_deref() != Some(d.id.as_str()) {
@@ -632,7 +635,8 @@ unsafe fn on_done(hwnd: HWND) {
         return; // clipboard changed meanwhile; drop the stale result
     }
     if fresh {
-        with_app(|a| a.last = Some(Last { id: d.id.clone(), original: d.original.clone(), factor: d.factor }));
+        let size = d.png.len();
+        with_app(|a| a.last = Some(Last { id: d.id.clone(), original: d.original.clone(), factor: d.factor, size }));
     }
     // While the editor is open its own Ctrl+Shift+Z (redo) must not be grabbed globally.
     if !editor::is_open() {
@@ -645,6 +649,7 @@ unsafe fn on_done(hwnd: HWND) {
         Kind::Optimised => format!("스크린샷 최적화 · {}×{}", d.w, d.h),
         Kind::Scaled => format!("{}% 축소 · {}×{}", (d.factor * 100.0).round(), d.w, d.h),
         Kind::Restored => format!("원본 복원 · {}×{}", d.w, d.h),
+        Kind::Kept => String::new(),
         Kind::Captured => match &d.desktop {
             Some(p) => format!("{} · {}×{}", p.file_stem().unwrap_or_default().to_string_lossy(), d.w, d.h),
             None => format!("스크린샷 · {}×{}", d.w, d.h),

@@ -24,7 +24,7 @@ use windows_sys::Win32::{
     UI::{
         Controls::Dialogs::*,
         HiDpi::*,
-        Input::KeyboardAndMouse::*,
+        Input::{Ime::*, KeyboardAndMouse::*},
         WindowsAndMessaging::*,
     },
 };
@@ -225,6 +225,7 @@ pub unsafe fn open(img: Rgba, title: &str, standalone: bool, export: Export) {
     ED.with(|c| *c.borrow_mut() = Some(ed));
     OPEN.with(|c| c.set(hwnd));
     with(|e| fit_view(e));
+    set_ime(hwnd, false);
     ShowWindow(hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd);
 }
@@ -346,7 +347,10 @@ fn snapshot(e: &mut Ed) {
 
 /// Puts the live object (new / moved / edited text) into `objs`.
 fn commit_live(e: &mut Ed) {
-    e.editing_text = false;
+    if e.editing_text {
+        e.editing_text = false;
+        unsafe { set_ime(e.hwnd, false) };
+    }
     let Some(o) = e.live.take() else { return };
     let at = e.live_at.take();
     if o.degenerate() {
@@ -358,7 +362,9 @@ fn commit_live(e: &mut Ed) {
     } else {
         let i = at.unwrap_or(e.objs.len()).min(e.objs.len());
         e.objs.insert(i, o);
-        e.sel = Some(i);
+        // Only moved/re-edited objects stay selected: a fresh drawing must not make the next
+        // Esc "deselect" instead of finishing (Shottr: Esc = copy & close).
+        e.sel = at.map(|_| i);
     }
     rebuild(e);
 }
@@ -383,6 +389,17 @@ fn undo(e: &mut Ed, redo: bool) {
         e.edited = true;
         rebuild(e);
     }
+}
+
+/// Single-key tools need raw keys: with the Korean IME in 한글 mode, letters arrive as
+/// VK_PROCESSKEY. The IME is detached except while a text object is being typed.
+unsafe fn set_ime(hwnd: HWND, on: bool) {
+    ImmAssociateContextEx(hwnd, null_mut(), if on { IACE_DEFAULT } else { 0 });
+}
+
+fn start_text(e: &mut Ed) {
+    e.editing_text = true;
+    unsafe { set_ime(e.hwnd, true) };
 }
 
 // ---------------------------------------------------------------- view
@@ -874,11 +891,18 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
         return After::Nothing;
     }
     // Existing object under the cursor: select & move (text with the text tool: edit).
-    if let Some(i) = (0..e.objs.len()).rev().find(|&i| e.objs[i].hit(e.scale, p.0, p.1, tol)) {
+    let grabs = |o: &Obj| {
+        let same = matches!(
+            (&o.shape, e.tool),
+            (Shape::Blur, Tool::Blur) | (Shape::Erase, Tool::Erase) | (Shape::Highlight, Tool::Highlight)
+        );
+        if same { o.hit(e.scale, p.0, p.1, tol) } else { o.hit_edge(e.scale, p.0, p.1, tol) }
+    };
+    if let Some(i) = (0..e.objs.len()).rev().find(|&i| grabs(&e.objs[i])) {
         let is_text = matches!(e.objs[i].shape, Shape::Text(_));
         lift(e, i);
         if is_text && e.tool == Tool::Text {
-            e.editing_text = true;
+            start_text(e);
             draw_live(e);
             InvalidateRect(e.hwnd, null(), 0);
             return After::Nothing;
@@ -896,14 +920,13 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
             let a = (p.0, p.1 - px as f32 * 0.6);
             e.live = Some(Obj { shape: Shape::Text(String::new()), a, b: a, color, size });
             e.live_at = None;
-            e.editing_text = true;
+            start_text(e);
             draw_live(e);
         }
         Tool::Counter => {
             snapshot(e);
             let n = e.objs.iter().filter_map(|o| if let Shape::Counter(n) = o.shape { Some(n) } else { None }).max().unwrap_or(0) + 1;
             e.objs.push(Obj { shape: Shape::Counter(n), a: p, b: p, color, size });
-            e.sel = Some(e.objs.len() - 1);
             rebuild(e);
         }
         _ => {
@@ -961,7 +984,16 @@ unsafe fn on_move(e: &mut Ed, x: i32, y: i32) {
             e.live_crop = Some((start.0.clamp(0.0, w), start.1.clamp(0.0, h), b.0.clamp(0.0, w), b.1.clamp(0.0, h)));
         }
     }
-    InvalidateRect(e.hwnd, null(), 0);
+    if e.drag == Drag::None {
+        // Hover only changes the coordinates in the status bar.
+        let mut rc: RECT = zeroed();
+        GetClientRect(e.hwnd, &mut rc);
+        let (_, sb) = bars(e);
+        rc.top = rc.bottom - sb;
+        InvalidateRect(e.hwnd, &rc, 0);
+    } else {
+        InvalidateRect(e.hwnd, null(), 0);
+    }
 }
 
 unsafe fn on_up(e: &mut Ed) {
@@ -1191,7 +1223,7 @@ unsafe fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<(LRESUL
                 let p = to_img(e, x, y);
                 if let Some(i) = (0..e.objs.len()).rev().find(|&i| matches!(e.objs[i].shape, Shape::Text(_)) && e.objs[i].hit(e.scale, p.0, p.1, 2.0)) {
                     lift(e, i);
-                    e.editing_text = true;
+                    start_text(e);
                     draw_live(e);
                     InvalidateRect(hwnd, null(), 0);
                 }
