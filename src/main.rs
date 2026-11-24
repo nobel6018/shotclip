@@ -339,7 +339,7 @@ unsafe fn show_menu(hwnd: HWND) {
     };
     item(1, "일시정지", paused);
     item(2, "파일 경로도 복사 (Clop 기본값)", copy_path);
-    item(6, "캡처를 바탕화면에도 저장 (Alt+Shift+3/4)", save_desktop);
+    item(6, "캡처를 바탕화면에도 저장", save_desktop);
     item(8, "캡처 후 편집기 열기", open_editor);
     item(3, "Windows 시작 시 실행", auto);
     AppendMenuW(m, MF_SEPARATOR, 0, null());
@@ -799,7 +799,9 @@ fn main() {
                 jobs: tx,
                 paused: store::get_bool("Paused", false),
                 copy_path: store::get_bool("CopyPath", true),
-                save_desktop: store::get_bool("SaveToDesktop", true),
+                // Like Shottr: captures live in the work folder (cleaned after 3 days); keep one with
+                // Ctrl+S in the editor, or turn Desktop saving on in the tray menu.
+                save_desktop: store::get_bool("SaveToDesktop", false),
                 open_editor: store::get_bool("OpenEditor", true),
                 hotkeys: false,
                 update: None,
