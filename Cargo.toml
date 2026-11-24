@@ -1,5 +1,5 @@
 [package]
-name = "shrinkclip"
+name = "shotclip"
 version = "0.2.0"
 edition = "2021"
 description = "Screenshot tool for Windows: macOS-style capture (Alt+Shift+3/4) + Clop-style clipboard optimiser"

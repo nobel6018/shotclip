@@ -46,7 +46,7 @@ pub fn formats() -> &'static Formats {
     F.get_or_init(|| unsafe {
         Formats {
             png: RegisterClipboardFormatW(wide("PNG").as_ptr()),
-            marker: RegisterClipboardFormatW(wide("ShrinkClip.Optimised").as_ptr()),
+            marker: RegisterClipboardFormatW(wide("ShotClip.Optimised").as_ptr()),
         }
     })
 }

@@ -1,4 +1,4 @@
-//! Work directory (Clop: ~/Library/Caches/Clop) and settings (HKCU\Software\ShrinkClip).
+//! Work directory (Clop: ~/Library/Caches/Clop) and settings (HKCU\Software\ShotClip).
 
 use crate::clip::wide;
 use std::{
@@ -15,7 +15,7 @@ pub fn workdir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("ShrinkClip")
+        .join("ShotClip")
 }
 
 fn sub(name: &str) -> PathBuf {
@@ -58,17 +58,43 @@ pub fn cleanup() {
     }
 }
 
-const KEY: &str = r"Software\ShrinkClip";
+const KEY: &str = r"Software\ShotClip";
+/// Pre-0.2 name; settings and the autostart entry are migrated from it.
+const OLD_KEY: &str = r"Software\ShrinkClip";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_NAME: &str = "ShrinkClip";
+const RUN_NAME: &str = "ShotClip";
+const OLD_RUN_NAME: &str = "ShrinkClip";
 
 pub fn get_bool(name: &str, default: bool) -> bool {
+    read_bool(KEY, name).or_else(|| read_bool(OLD_KEY, name)).unwrap_or(default)
+}
+
+/// Moves a ShrinkClip-era autostart entry over to this exe.
+pub fn migrate_autostart() {
+    let old = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(RUN_KEY).as_ptr(),
+            wide(OLD_RUN_NAME).as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) == 0
+    };
+    if old {
+        unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), wide(OLD_RUN_NAME).as_ptr()) };
+        set_autostart(true);
+    }
+}
+
+fn read_bool(key: &str, name: &str) -> Option<bool> {
     let mut v: u32 = 0;
     let mut size = 4u32;
     let r = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            wide(KEY).as_ptr(),
+            wide(key).as_ptr(),
             wide(name).as_ptr(),
             RRF_RT_REG_DWORD,
             std::ptr::null_mut(),
@@ -76,7 +102,7 @@ pub fn get_bool(name: &str, default: bool) -> bool {
             &mut size,
         )
     };
-    if r == 0 { v != 0 } else { default }
+    (r == 0).then_some(v != 0)
 }
 
 pub fn set_bool(name: &str, value: bool) {

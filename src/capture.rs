@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 };
 
 const PW_RENDERFULLCONTENT: u32 = 2;
-pub const OVERLAY_CLASS: &str = "ShrinkClipCaptureOverlay";
+pub const OVERLAY_CLASS: &str = "ShotClipCaptureOverlay";
 
 // ---------------------------------------------------------------- imagesimages
 
@@ -351,7 +351,7 @@ pub unsafe fn start_area(main: HWND) {
     let hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         wide(OVERLAY_CLASS).as_ptr(),
-        wide("ShrinkClip capture").as_ptr(),
+        wide("ShotClip capture").as_ptr(),
         WS_POPUP,
         vs.left,
         vs.top,

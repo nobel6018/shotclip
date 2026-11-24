@@ -1,6 +1,6 @@
-# ShrinkClip
+# ShotClip
 
-<img src="assets/shrinkclip.png" width="96" alt="ShrinkClip icon">
+<img src="assets/shotclip.png" width="96" alt="ShotClip icon">
 
 Windows용 스크린샷 트레이 앱.
 
@@ -30,7 +30,7 @@ Windows용 스크린샷 트레이 앱.
 1. 클립보드에 "그림만" 들어오면 감지 (Office/텍스트/파일 복사 등은 건드리지 않음)
 2. pngquant 방식(품질 0–100, speed 4)으로 팔레트 압축, 메타데이터 제거
    - 결과가 원본보다 크면 원본 유지
-3. `%LOCALAPPDATA%\ShrinkClip\images\`에 저장하고 클립보드에 **이미지 + 파일 + 경로 텍스트**를 넣음
+3. `%LOCALAPPDATA%\ShotClip\images\`에 저장하고 클립보드에 **이미지 + 파일 + 경로 텍스트**를 넣음
    (원본은 `originals\`에 보관, 3일 뒤 자동 삭제)
 4. 해상도 축소는 자동으로 하지 않음. 결과 직후 30초 동안 단축키 사용 가능:
 
@@ -47,11 +47,11 @@ Windows용 스크린샷 트레이 앱.
 - Windows 시작 시 실행
 - 작업 폴더 열기 / 종료
 
-설정은 `HKCU\Software\ShrinkClip`에 저장됩니다.
+설정은 `HKCU\Software\ShotClip`에 저장됩니다. (이전 이름 ShrinkClip의 설정과 시작 프로그램 등록은 자동으로 옮겨집니다.)
 
 ## 설치
 
-[Releases](../../releases)에서 `shrinkclip.exe`를 받아 실행하세요. 설치 과정은 없습니다.
+[Releases](../../releases)에서 `shotclip.exe`를 받아 실행하세요. 설치 과정은 없습니다.
 
 ## 빌드
 
@@ -62,7 +62,7 @@ cargo build --release
 
 `rust-toolchain.toml`이 GNU 툴체인을 지정합니다(MSVC Build Tools 없이 빌드 가능).
 
-아이콘은 `assets/shrinkclip.ico`이며 `build.rs`가 windres 없이 exe 리소스로 넣습니다.
+아이콘은 `assets/shotclip.ico`이며 `build.rs`가 windres 없이 exe 리소스로 넣습니다.
 아이콘을 다시 그리려면 `cargo run --example gen_icon`.
 
 ## 라이선스

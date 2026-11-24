@@ -1,4 +1,4 @@
-//! Renders assets/shrinkclip.ico (and a 256px PNG preview).
+//! Renders assets/shotclip.ico (and a 256px PNG preview).
 //! Run: `cargo run --example gen_icon`
 //!
 //! Design: rounded teal tile, white clipboard, two inward-pointing arrows (= shrink).
@@ -112,7 +112,7 @@ fn main() {
         ico.extend_from_slice(data);
     }
     fs::create_dir_all("assets").unwrap();
-    fs::write("assets/shrinkclip.ico", ico).unwrap();
-    fs::write("assets/shrinkclip.png", &imgs.last().unwrap().1).unwrap();
-    println!("wrote assets/shrinkclip.ico ({} sizes) and assets/shrinkclip.png", imgs.len());
+    fs::write("assets/shotclip.ico", ico).unwrap();
+    fs::write("assets/shotclip.png", &imgs.last().unwrap().1).unwrap();
+    println!("wrote assets/shotclip.ico ({} sizes) and assets/shotclip.png", imgs.len());
 }

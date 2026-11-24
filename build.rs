@@ -1,4 +1,4 @@
-//! Embeds assets/shrinkclip.ico as the exe icon (group icon ID 1).
+//! Embeds assets/shotclip.ico as the exe icon (group icon ID 1).
 //!
 //! The GNU toolchain here has no windres, so instead of a .rc file this writes a minimal
 //! COFF object with a `.rsrc` section (what windres/cvtres would produce) and links it.
@@ -6,7 +6,7 @@
 
 use std::{env, fs, path::PathBuf};
 
-const ICO: &str = "assets/shrinkclip.ico";
+const ICO: &str = "assets/shotclip.ico";
 const RT_ICON: u32 = 3;
 const RT_GROUP_ICON: u32 = 14;
 const LANG: u32 = 0x0409;
@@ -171,7 +171,7 @@ fn main() {
     let ico = fs::read(ICO).expect("read icon");
     let (sec, relocs) = rsrc_section(&icon_resources(&ico));
     let obj = coff(&sec, &relocs);
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shrinkclip_res.o");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shotclip_res.o");
     fs::write(&out, obj).unwrap();
     println!("cargo:rustc-link-arg-bins={}", out.display());
 }

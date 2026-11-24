@@ -1,9 +1,9 @@
-//! ShrinkClip: screenshot tool for Windows.
+//! ShotClip: screenshot tool for Windows.
 //!
 //! - Alt+Shift+3 / Alt+Shift+4: macOS-style capture (see capture.rs). Results go through the
 //!   same optimiser, onto the clipboard and (optionally) to the Desktop like macOS.
 //! - Watches the clipboard; when a plain image arrives (e.g. Win+Shift+S), it quantises it
-//!   like Clop (pngquant engine), saves it to %LOCALAPPDATA%\ShrinkClip\images and puts
+//!   like Clop (pngquant engine), saves it to %LOCALAPPDATA%\ShotClip\images and puts
 //!   PNG + CF_DIB (+ file + path text) back on the clipboard.
 //! - For 30 s after a result: Ctrl+Shift+- downscales (100→75→50→40…%), Ctrl+Shift+Z restores
 //!   the original. Like Clop, the keys are only grabbed while a result is "live".
@@ -239,7 +239,7 @@ unsafe fn nid(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 fn tip(paused: bool) -> &'static str {
-    if paused { "ShrinkClip (일시정지)" } else { "ShrinkClip: 클립보드 이미지 최적화 중" }
+    if paused { "ShotClip (최적화 일시정지) · Alt+Shift+3/4 캡처" } else { "ShotClip · Alt+Shift+3/4 캡처 · 클립보드 최적화 중" }
 }
 
 /// Icon resource 1 (embedded by build.rs) at the given size, falling back to the stock icon.
@@ -416,7 +416,7 @@ unsafe fn on_done(hwnd: HWND) {
     let Some(r) = RESULTS.lock().unwrap().pop_front() else { return };
     let d = match r {
         Ok(d) => d,
-        Err(e) => return notify(hwnd, "ShrinkClip 오류", &e),
+        Err(e) => return notify(hwnd, "ShotClip 오류", &e),
     };
     if !d.clip {
         return; // extra monitor of a full-screen capture: file only
@@ -496,7 +496,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn main() {
     unsafe {
-        CreateMutexW(null(), 0, wide(r"Local\ShrinkClip.SingleInstance").as_ptr());
+        CreateMutexW(null(), 0, wide(r"Local\ShotClip.SingleInstance").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -509,7 +509,7 @@ fn main() {
         let oc_name = wide(capture::OVERLAY_CLASS);
         oc.lpszClassName = oc_name.as_ptr();
         RegisterClassW(&oc);
-        let class = wide("ShrinkClipWnd");
+        let class = wide("ShotClipWnd");
         let mut wc: WNDCLASSW = zeroed();
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinst;
@@ -519,7 +519,7 @@ fn main() {
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("ShrinkClip").as_ptr(),
+            wide("ShotClip").as_ptr(),
             WS_OVERLAPPED,
             0,
             0,
@@ -551,11 +551,12 @@ fn main() {
 
         tray_add(hwnd);
         AddClipboardFormatListener(hwnd);
+        store::migrate_autostart();
         let mods = MOD_ALT | MOD_SHIFT | MOD_NOREPEAT;
         let ok3 = RegisterHotKey(hwnd, HK_CAPTURE_FULL, mods, '3' as u32) != 0;
         let ok4 = RegisterHotKey(hwnd, HK_CAPTURE_AREA, mods, '4' as u32) != 0;
         if !(ok3 && ok4) {
-            notify(hwnd, "ShrinkClip", "Alt+Shift+3/4 단축키를 등록하지 못했습니다 (다른 앱이 사용 중).");
+            notify(hwnd, "ShotClip", "Alt+Shift+3/4 단축키를 등록하지 못했습니다 (다른 앱이 사용 중).");
         }
         thread::spawn(store::cleanup);
         SetTimer(hwnd, TIMER_CLEANUP, 6 * 3600 * 1000, None);
