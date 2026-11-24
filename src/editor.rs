@@ -54,6 +54,7 @@ enum Item {
     Tool(Tool),
     Color(u32),
     Size(u8),
+    Tail,
     Undo,
     Save,
     Done,
@@ -94,6 +95,10 @@ struct Ed {
     live_at: Option<usize>,
     live_crop: Crop,
     editing_text: bool,
+    /// IME composition in progress (shown after the text, not yet part of it).
+    comp: String,
+    /// Tail on/off for new text boxes.
+    tail: bool,
     sel: Option<usize>,
     drag: Drag,
     tool: Tool,
@@ -207,6 +212,8 @@ pub unsafe fn open(img: Rgba, title: &str, standalone: bool, export: Export) {
         live_at: None,
         live_crop: None,
         editing_text: false,
+        comp: String::new(),
+        tail: true,
         sel: None,
         drag: Drag::None,
         tool,
@@ -324,8 +331,18 @@ fn rebuild(e: &mut Ed) {
 }
 
 /// Updates `work`/`disp` for the current live object, touching only the changed region.
+/// The live object as displayed: text being typed includes the IME composition.
+fn shown(e: &Ed) -> Option<Obj> {
+    let mut o = e.live.clone()?;
+    if let Shape::Text(t) = &mut o.shape {
+        t.push_str(&e.comp);
+    }
+    Some(o)
+}
+
 fn draw_live(e: &mut Ed) {
-    let new_box = e.live.as_ref().map(|o| o.bounds(e.scale));
+    let live = shown(e);
+    let new_box = live.as_ref().map(|o| o.bounds(e.scale));
     let dirty = union(e.live_box, new_box);
     let Some(r) = dirty.and_then(|d| clip_rect((d.0 - 2.0, d.1 - 2.0, d.2 + 2.0, d.3 + 2.0), e.base.w, e.base.h)) else {
         e.live_box = new_box;
@@ -336,7 +353,7 @@ fn draw_live(e: &mut Ed) {
         let (a, b) = ((y * w + r.0 as usize) * 4, (y * w + r.2 as usize) * 4);
         e.work.px[a..b].copy_from_slice(&e.committed.px[a..b]);
     }
-    if let Some(o) = &e.live {
+    if let Some(o) = &live {
         annot::draw(&mut e.work, &e.base, o, e.scale);
     }
     e.live_box = new_box;
@@ -352,8 +369,20 @@ fn snapshot(e: &mut Ed) {
 /// Puts the live object (new / moved / edited text) into `objs`.
 fn commit_live(e: &mut Ed) {
     if e.editing_text {
+        // Keep a syllable still being composed (click elsewhere / Esc mid-composition).
+        let comp = std::mem::take(&mut e.comp);
+        if let Some(Obj { shape: Shape::Text(t), .. }) = e.live.as_mut() {
+            t.push_str(&comp);
+        }
         e.editing_text = false;
-        unsafe { set_ime(e.hwnd, false) };
+        unsafe {
+            let h = ImmGetContext(e.hwnd);
+            if !h.is_null() {
+                ImmNotifyIME(h, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                ImmReleaseContext(e.hwnd, h);
+            }
+            set_ime(e.hwnd, false);
+        }
     }
     let Some(o) = e.live.take() else { return };
     let at = e.live_at.take();
@@ -627,7 +656,8 @@ unsafe fn paint_crop(e: &Ed, dc: HDC) {
 }
 
 unsafe fn paint_selection(e: &Ed, dc: HDC) {
-    let target = match (e.sel, &e.live) {
+    let live = shown(e);
+    let target = match (e.sel, &live) {
         (Some(i), _) => e.objs.get(i),
         (None, Some(o)) if e.editing_text => Some(o),
         _ => None,
@@ -713,6 +743,19 @@ unsafe fn paint_toolbar(e: &mut Ed, dc: HDC, cw: i32) {
         e.layout.push((r, Item::Size(s)));
         x += r.right - r.left + (2.0 * u) as i32;
     }
+    if let Some(on) = tail_state(e) {
+        x += (8.0 * u) as i32;
+        let label = if on { "꼬리 켬" } else { "꼬리 끔" };
+        let w = text_w(dc, label) + (20.0 * u) as i32;
+        let r = RECT { left: x, top, right: x + w, bottom: bot };
+        fill(dc, &r, if on { 0x4A4A4A } else { 0x333333 });
+        if on {
+            fill(dc, &RECT { left: r.left, top: r.bottom - (2.0 * u) as i32, right: r.right, bottom: r.bottom }, 0x3DA5FF);
+        }
+        draw_text(dc, label, &r, if on { 0xF0F0F0 } else { 0x8A8A8A }, DT_CENTER);
+        e.layout.push((r, Item::Tail));
+        x += w;
+    }
     // Right side: undo, save, done.
     let mut rx = cw - pad;
     for (label, item, accent) in [("완료 · 복사  Esc", Item::Done, true), ("저장  Ctrl+S", Item::Save, false), ("되돌리기", Item::Undo, false)] {
@@ -790,6 +833,43 @@ fn set_tool(e: &mut Ed, t: Tool) {
     e.status.clear();
 }
 
+/// Tail toggle state shown in the toolbar: the text being edited / selected, else the default
+/// for new text (only while the text tool is active).
+fn tail_state(e: &Ed) -> Option<bool> {
+    let text = |o: &Obj| matches!(o.shape, Shape::Text(_)).then_some(o.tail);
+    if e.editing_text {
+        return e.live.as_ref().and_then(text);
+    }
+    if let Some(o) = e.sel.and_then(|i| e.objs.get(i)) {
+        return text(o);
+    }
+    (e.tool == Tool::Text).then_some(e.tail)
+}
+
+fn toggle_tail(e: &mut Ed) {
+    let Some(on) = tail_state(e).map(|t| !t) else { return };
+    e.tail = on;
+    let s = e.scale;
+    let set = |o: &mut Obj| {
+        o.tail = on;
+        // A box made by a plain click has its tip inside: give it one below the box.
+        if let Some(b) = o.bubble(s).filter(|b| on && b.tail.is_none()) {
+            let px = s.font_px(o.size) as f32;
+            o.b = (b.x0 + px, b.y1 + px * 1.5);
+        }
+    };
+    if e.editing_text {
+        if let Some(o) = e.live.as_mut() {
+            set(o);
+        }
+        draw_live(e);
+    } else if let Some(i) = e.sel {
+        snapshot(e);
+        set(&mut e.objs[i]);
+        rebuild(e);
+    }
+}
+
 /// Applies colour/size to the selection too (like most editors).
 fn restyle_selection(e: &mut Ed, color: Option<u32>, size: Option<u8>) {
     let Some(i) = e.sel else { return };
@@ -834,6 +914,7 @@ unsafe fn click_item(e: &mut Ed, item: Item) -> After {
                 restyle_selection(e, None, Some(s));
             }
         }
+        Item::Tail => toggle_tail(e),
         Item::Undo => undo(e, false),
         Item::Save => return After::SaveAs,
         Item::Done => return After::Finish,
@@ -937,7 +1018,7 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
             snapshot(e);
             let px = e.scale.font_px(size);
             let a = (p.0, p.1 - px as f32 * 0.6);
-            e.live = Some(Obj { shape: Shape::Text(String::new()), a, b: a, color, size });
+            e.live = Some(Obj { shape: Shape::Text(String::new()), a, b: a, color, size, tail: e.tail });
             e.live_at = None;
             start_text(e);
             draw_live(e);
@@ -948,13 +1029,13 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
         Tool::Counter => {
             snapshot(e);
             let n = e.objs.iter().filter_map(|o| if let Shape::Counter(n) = o.shape { Some(n) } else { None }).max().unwrap_or(0) + 1;
-            e.objs.push(Obj { shape: Shape::Counter(n), a: p, b: p, color, size });
+            e.objs.push(Obj { shape: Shape::Counter(n), a: p, b: p, color, size, tail: true });
             rebuild(e);
         }
         _ => {
             if let Some(shape) = new_shape(e, p) {
                 snapshot(e);
-                e.live = Some(Obj { shape, a: p, b: p, color, size });
+                e.live = Some(Obj { shape, a: p, b: p, color, size, tail: true });
                 e.live_at = None;
                 e.drag = Drag::Draw;
                 SetCapture(e.hwnd);
@@ -1203,6 +1284,36 @@ unsafe fn on_char(e: &mut Ed, ch: u16) {
     InvalidateRect(e.hwnd, null(), 0);
 }
 
+unsafe fn ime_string(h: HIMC, kind: IME_COMPOSITION_STRING) -> String {
+    let n = ImmGetCompositionStringW(h, kind, null_mut(), 0);
+    if n <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; n as usize / 2];
+    ImmGetCompositionStringW(h, kind, buf.as_mut_ptr().cast(), n as u32);
+    String::from_utf16_lossy(&buf)
+}
+
+unsafe fn on_ime(e: &mut Ed, lp: LPARAM) {
+    let h = ImmGetContext(e.hwnd);
+    if h.is_null() {
+        return;
+    }
+    let flags = lp as u32;
+    let result = if flags & GCS_RESULTSTR != 0 { ime_string(h, GCS_RESULTSTR) } else { String::new() };
+    e.comp = if flags & GCS_COMPSTR != 0 { ime_string(h, GCS_COMPSTR) } else { String::new() };
+    ImmReleaseContext(e.hwnd, h);
+    if !e.editing_text {
+        e.comp.clear();
+        return;
+    }
+    if let Some(Obj { shape: Shape::Text(t), .. }) = e.live.as_mut() {
+        t.push_str(&result);
+    }
+    draw_live(e);
+    InvalidateRect(e.hwnd, null(), 0);
+}
+
 // ---------------------------------------------------------------- save as
 
 unsafe fn save_as(hwnd: HWND) {
@@ -1315,6 +1426,21 @@ unsafe fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<(LRESUL
             }
             WM_CHAR => {
                 on_char(e, wp as u16);
+                After::Nothing
+            }
+            // Draw the composition inline (no IME window at the screen corner); the finished
+            // syllable is taken from GCS_RESULTSTR, so no WM_IME_CHAR/WM_CHAR follows.
+            WM_IME_STARTCOMPOSITION => After::Nothing,
+            WM_IME_COMPOSITION => {
+                on_ime(e, lp);
+                After::Nothing
+            }
+            WM_IME_ENDCOMPOSITION => {
+                if !e.comp.is_empty() {
+                    e.comp.clear();
+                    draw_live(e);
+                    InvalidateRect(hwnd, null(), 0);
+                }
                 After::Nothing
             }
             WM_SETCURSOR if (lp & 0xFFFF) as u32 == HTCLIENT => {

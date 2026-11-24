@@ -52,6 +52,8 @@ pub struct Obj {
     pub color: u32,
     /// 0 = thin, 1 = medium, 2 = thick
     pub size: u8,
+    /// Text: draw the speech-bubble tail (the tip in `b` is kept while it is hidden).
+    pub tail: bool,
 }
 
 /// Physical-pixel scale for stroke widths/fonts: captures of HiDPI screens get thicker strokes.
@@ -164,6 +166,9 @@ impl Obj {
         let (x1, y1) = (self.a.0 + w as f32 + padx, self.a.1 + h as f32 + pady);
         let r = (px * 0.25).min((y1 - y0) / 2.0).min((x1 - x0) / 2.0);
         let mut bb = Bubble { x0, y0, x1, y1, r, tail: None };
+        if !self.tail {
+            return Some(bb);
+        }
         let (tx, ty) = self.b;
         let ox = (x0 - tx).max(tx - x1).max(0.0);
         let oy = (y0 - ty).max(ty - y1).max(0.0);
@@ -640,7 +645,7 @@ mod tests {
         [img.px[i], img.px[i + 1], img.px[i + 2]]
     }
     fn obj(shape: Shape, a: (f32, f32), b: (f32, f32)) -> Obj {
-        Obj { shape, a, b, color: 0xFF0000, size: 1 }
+        Obj { shape, a, b, color: 0xFF0000, size: 1, tail: true }
     }
 
     #[test]
@@ -749,6 +754,10 @@ mod tests {
         t.b = (290.0, 50.0);
         let tri = t.bubble(s).unwrap().tail.unwrap();
         assert!((tri[0].0 - (t.bubble(s).unwrap().x1 - 1.0)).abs() < 0.01);
+        // Tail switched off: no tail, the tip is kept for when it is switched back on.
+        t.tail = false;
+        assert!(t.bubble(s).unwrap().tail.is_none() && t.b == (290.0, 50.0));
+        assert!(!t.hit(s, 285.0, 50.0, 2.0));
     }
 
     #[test]
@@ -783,7 +792,7 @@ mod sample {
             blit_mask(&mut cv, &m, mw, mh, 40, 420, 0x202020, 1.0);
             blit_mask(&mut cv, &m, mw, mh, 40, 470, 0x202020, 1.0);
         }
-        let o = |shape, a, b, color, size| Obj { shape, a, b, color, size };
+        let o = |shape, a, b, color, size| Obj { shape, a, b, color, size, tail: true };
         let s = Scale(1.0);
         let objs = vec![
             o(Shape::Arrow, (60.0, 60.0), (300.0, 180.0), 0xE5383B, 0),
