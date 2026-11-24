@@ -44,7 +44,8 @@ pub enum Shape {
 #[derive(Clone, Debug)]
 pub struct Obj {
     pub shape: Shape,
-    /// Start / end point in image pixels (for Text and Counter: `a` is the anchor).
+    /// Start / end point in image pixels. Counter: `a` is the centre. Text: `a` is the top-left
+    /// of the glyphs and `b` the tip of the speech-bubble tail (`b` inside the box = no tail).
     pub a: (f32, f32),
     pub b: (f32, f32),
     /// 0xRRGGBB
@@ -90,9 +91,13 @@ impl Obj {
                 }
                 (r.0 - pad, r.1 - pad, r.2 + pad, r.3 + pad)
             }
-            Shape::Text(t) => {
-                let (w, h) = text_size(t, s.font_px(self.size));
-                (self.a.0 - 2.0, self.a.1 - 2.0, self.a.0 + w as f32 + 2.0, self.a.1 + h as f32 + 2.0)
+            Shape::Text(_) => {
+                let bb = self.bubble(s).unwrap();
+                let (mut x0, mut y0, mut x1, mut y1) = (bb.x0, bb.y0, bb.x1, bb.y1);
+                if bb.tail.is_some() {
+                    (x0, y0, x1, y1) = (x0.min(self.b.0), y0.min(self.b.1), x1.max(self.b.0), y1.max(self.b.1));
+                }
+                (x0 - 2.0, y0 - 2.0, x1 + 2.0, y1 + 2.0)
             }
             Shape::Counter(_) => {
                 let r = s.counter_r(self.size) + 2.0;
@@ -124,7 +129,11 @@ impl Obj {
             Shape::Pen(pts) => pts.windows(2).any(|w| seg_dist(x, y, w[0], w[1]) <= hw),
             Shape::Rect => rect_dist(x, y, x0, y0, x1, y1).abs() <= hw,
             Shape::Oval => ellipse_dist(x, y, x0, y0, x1, y1).abs() <= hw,
-            Shape::Highlight | Shape::Blur | Shape::Erase | Shape::Text(_) | Shape::Counter(_) => {
+            Shape::Text(_) => {
+                let bb = self.bubble(s).unwrap();
+                rr_dist(x, y, &bb) <= tol || bb.tail.is_some_and(|t| tri_dist(x, y, t) <= tol)
+            }
+            Shape::Highlight | Shape::Blur | Shape::Erase | Shape::Counter(_) => {
                 let b = self.bounds(s);
                 x >= b.0 - tol && x <= b.2 + tol && y >= b.1 - tol && y <= b.3 + tol
             }
@@ -140,6 +149,45 @@ impl Obj {
             }
             _ => self.hit(s, x, y, tol),
         }
+    }
+
+    /// Shottr-style text box (ObjText): a rounded box filled with the annotation colour, with an
+    /// optional tail toward `b`. Corner radius = font size × 0.25 (Shottr: `fontsize·scale·0.25`);
+    /// the tail's base widens with its length (Shottr: `fontsize·(√dist/35 + 0.9)`), and it sits
+    /// on the side facing the tip, kept clear of the rounded corners.
+    pub fn bubble(&self, s: Scale) -> Option<Bubble> {
+        let Shape::Text(t) = &self.shape else { return None };
+        let px = s.font_px(self.size) as f32;
+        let (w, h) = text_size(if t.is_empty() { " " } else { t }, px as i32);
+        let (padx, pady) = (px * 0.35, px * 0.15);
+        let (x0, y0) = (self.a.0 - padx, self.a.1 - pady);
+        let (x1, y1) = (self.a.0 + w as f32 + padx, self.a.1 + h as f32 + pady);
+        let r = (px * 0.25).min((y1 - y0) / 2.0).min((x1 - x0) / 2.0);
+        let mut bb = Bubble { x0, y0, x1, y1, r, tail: None };
+        let (tx, ty) = self.b;
+        let ox = (x0 - tx).max(tx - x1).max(0.0);
+        let oy = (y0 - ty).max(ty - y1).max(0.0);
+        if ox.hypot(oy) < px * 0.4 {
+            return Some(bb);
+        }
+        let dist = ox.hypot(oy);
+        let base = |lo: f32, hi: f32, along: f32| {
+            let hw = (px * 0.375 * (dist.sqrt() / 35.0 + 0.9)).min((hi - lo) / 2.0 - r).max(1.0);
+            let (l, h) = (lo + r + hw, hi - r - hw);
+            let c = if l <= h { along.clamp(l, h) } else { (lo + hi) / 2.0 };
+            (c - hw, c + hw)
+        };
+        bb.tail = Some(if ox > oy {
+            // Left or right side; the base overlaps the box by 1 px so there is no seam.
+            let (sx, inw) = if tx < x0 { (x0, 1.0) } else { (x1, -1.0) };
+            let (b0, b1) = base(y0, y1, ty);
+            [(sx + inw, b0), (sx + inw, b1), (tx, ty)]
+        } else {
+            let (sy, inw) = if ty < y0 { (y0, 1.0) } else { (y1, -1.0) };
+            let (b0, b1) = base(x0, x1, tx);
+            [(b0, sy + inw), (b1, sy + inw), (tx, ty)]
+        });
+        Some(bb)
     }
 
     /// Too small to keep (a click without drag for drag-shaped tools).
@@ -160,6 +208,22 @@ impl Obj {
 }
 
 // ---------------------------------------------------------------- geometry
+
+/// Text box geometry (see `Obj::bubble`).
+#[derive(Clone, Copy, Debug)]
+pub struct Bubble {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub r: f32,
+    pub tail: Option<[(f32, f32); 3]>,
+}
+
+/// Signed distance to the rounded box (negative inside).
+fn rr_dist(px: f32, py: f32, b: &Bubble) -> f32 {
+    rect_dist(px, py, b.x0 + b.r, b.y0 + b.r, b.x1 - b.r, b.y1 - b.r) - b.r
+}
 
 fn seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
@@ -329,15 +393,15 @@ pub fn draw(out: &mut Rgba, orig: &Rgba, o: &Obj, s: Scale) {
             }
         }
         Shape::Text(t) => {
-            let px = s.font_px(o.size);
-            if let Some((mw, mh, mask)) = text_mask(t, px) {
-                // Thin contrasting outline so text reads on any background.
-                let outline = if luma(o.color) > 150 { 0x000000 } else { 0xFFFFFF };
-                let r = (px as f32 / 14.0).max(1.0).round() as i32;
-                let (ax, ay) = (o.a.0.round() as i32, o.a.1.round() as i32);
-                let halo = dilate(&mask, mw, mh, r);
-                blit_mask(&mut cv, &halo, mw, mh, ax, ay, outline, 0.6);
-                blit_mask(&mut cv, &mask, mw, mh, ax, ay, o.color, 1.0);
+            // Shottr: a filled rounded box (+ tail) in the colour, text in a contrasting colour.
+            let bb = o.bubble(s).unwrap();
+            cv.shade(o.bounds(s), o.color, |x, y| {
+                let d = bb.tail.map_or(f32::MAX, |t| tri_dist(x, y, t)).min(rr_dist(x, y, &bb));
+                cov(0.0, d)
+            });
+            let fg = if luma(o.color) > 170 { 0x111111 } else { 0xFFFFFF };
+            if let Some((mw, mh, mask)) = text_mask(t, s.font_px(o.size)) {
+                blit_mask(&mut cv, &mask, mw, mh, o.a.0.round() as i32, o.a.1.round() as i32, fg, 1.0);
             }
         }
         Shape::Counter(n) => {
@@ -410,6 +474,7 @@ fn blit_mask(cv: &mut Canvas, m: &[u8], mw: usize, mh: usize, ax: i32, ay: i32, 
     }
 }
 
+#[allow(dead_code)]
 fn dilate(m: &[u8], w: usize, h: usize, r: i32) -> Vec<u8> {
     let mut out = vec![0u8; m.len()];
     for y in 0..h as i32 {
@@ -651,7 +716,39 @@ mod tests {
         let white_in_disc = (24..36).any(|y| (24..36).any(|x| at(&out, x, y) == [255, 255, 255]));
         assert!(white_in_disc, "number drawn in white");
         let blue = (10..50).any(|y| (60..120).any(|x| { let p = at(&out, x, y); p[2] > 200 && p[0] < 60 }));
-        assert!(blue, "text drawn");
+        assert!(blue, "text box drawn");
+    }
+
+    #[test]
+    fn text_is_a_speech_bubble() {
+        let base = blank(300, 200, 255);
+        let s = Scale(1.0);
+        let mut t = obj(Shape::Text("Hello".into()), (150.0, 40.0), (150.0, 40.0));
+        t.color = 0xE5383B;
+        let bb = t.bubble(s).unwrap();
+        assert!(bb.tail.is_none(), "b inside the box: no tail");
+        // Box filled with the colour, glyphs in white.
+        let out = render(&base, &[t.clone()], s);
+        assert_eq!(at(&out, (bb.x0 + 3.0) as u32, ((bb.y0 + bb.y1) / 2.0) as u32), [0xE5, 0x38, 0x3B]);
+        let white = ((bb.y0 as u32 + 2)..(bb.y1 as u32 - 2)).any(|y| ((bb.x0 as u32 + 4)..(bb.x1 as u32 - 4)).any(|x| at(&out, x, y) == [255, 255, 255]));
+        assert!(white, "contrasting text");
+        // Rounded corner stays background.
+        assert_eq!(at(&out, bb.x0 as u32, bb.y0 as u32), [255, 255, 255]);
+        // Tail toward a point below-left: drawn down to the tip, from the bottom side.
+        t.b = (60.0, 180.0);
+        let bb = t.bubble(s).unwrap();
+        let tri = bb.tail.expect("tail");
+        assert!((tri[0].1 - (bb.y1 - 1.0)).abs() < 0.01 && tri[2] == (60.0, 180.0));
+        let out = render(&base, &[t.clone()], s);
+        // A point on the tail's centre line, 80 % of the way to the tip.
+        let (mx, my) = ((tri[0].0 + tri[1].0) / 2.0, (tri[0].1 + tri[1].1) / 2.0);
+        let (qx, qy) = (mx + (60.0 - mx) * 0.8, my + (180.0 - my) * 0.8);
+        assert_eq!(at(&out, qx as u32, qy as u32), [0xE5, 0x38, 0x3B]);
+        assert!(t.hit(s, qx, qy, 2.0) && !t.hit(s, 250.0, 180.0, 2.0));
+        // Tail to the right picks the right side.
+        t.b = (290.0, 50.0);
+        let tri = t.bubble(s).unwrap().tail.unwrap();
+        assert!((tri[0].0 - (t.bubble(s).unwrap().x1 - 1.0)).abs() < 0.01);
     }
 
     #[test]
@@ -696,7 +793,8 @@ mod sample {
             o(Shape::Oval, (600.0, 40.0), (860.0, 160.0), 0x2DC653, 2),
             o(Shape::Line, (360.0, 200.0), (560.0, 260.0), 0x8E44AD, 1),
             o(Shape::Pen(vec![(600.0, 220.0), (640.0, 200.0), (690.0, 260.0), (740.0, 210.0), (800.0, 250.0)]), (0.0, 0.0), (0.0, 0.0), 0xF77F00, 1),
-            o(Shape::Text("텍스트 Text\n두 번째 줄".into()), (360.0, 290.0), (360.0, 290.0), 0xE5383B, 1),
+            o(Shape::Text("텍스트 Text\n두 번째 줄".into()), (360.0, 290.0), (330.0, 380.0), 0xE5383B, 1),
+            o(Shape::Text("노란 말풍선".into()), (560.0, 400.0), (560.0, 400.0), 0xFFD60A, 2),
             o(Shape::Counter(1), (650.0, 320.0), (650.0, 320.0), 0xE5383B, 1),
             o(Shape::Counter(2), (710.0, 320.0), (710.0, 320.0), 0x1E88E5, 2),
             o(Shape::Counter(12), (770.0, 320.0), (770.0, 320.0), 0xFFD60A, 0),

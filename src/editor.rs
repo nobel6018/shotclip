@@ -66,6 +66,10 @@ enum Drag {
     Move { last: (f32, f32), moved: bool },
     Crop { start: (f32, f32) },
     Pan { last: (i32, i32) },
+    /// Text tool drag: the tail tip stays where the drag started, the box follows the cursor.
+    TextTail { start: (f32, f32) },
+    /// Dragging the tip of an existing text's tail.
+    Tip,
 }
 
 type Crop = Option<(f32, f32, f32, f32)>;
@@ -893,6 +897,18 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
         SetCapture(e.hwnd);
         return After::Nothing;
     }
+    // Tail tip of a speech bubble: drag it (back into the box removes the tail).
+    let tip_tol = 8.0 / e.zoom;
+    if let Some(i) = (0..e.objs.len()).rev().find(|&i| {
+        let o = &e.objs[i];
+        o.bubble(e.scale).is_some_and(|b| b.tail.is_some()) && (o.b.0 - p.0).hypot(o.b.1 - p.1) <= tip_tol
+    }) {
+        lift(e, i);
+        e.drag = Drag::Tip;
+        SetCapture(e.hwnd);
+        InvalidateRect(e.hwnd, null(), 0);
+        return After::Nothing;
+    }
     // Existing object under the cursor: select & move (text with the text tool: edit).
     let grabs = |o: &Obj| {
         let same = matches!(
@@ -925,6 +941,9 @@ unsafe fn on_down(e: &mut Ed, x: i32, y: i32, button: u32) -> After {
             e.live_at = None;
             start_text(e);
             draw_live(e);
+            // Click = plain text box; drag = speech bubble pointing at where the drag started.
+            e.drag = Drag::TextTail { start: p };
+            SetCapture(e.hwnd);
         }
         Tool::Counter => {
             snapshot(e);
@@ -981,6 +1000,20 @@ unsafe fn on_move(e: &mut Ed, x: i32, y: i32) {
             e.drag = Drag::Move { last: p, moved: true };
             draw_live(e);
         }
+        Drag::TextTail { start } => {
+            let px = e.scale.font_px(e.live.as_ref().map_or(e.size, |o| o.size)) as f32;
+            if let Some(o) = e.live.as_mut() {
+                o.a = (p.0, p.1 - px * 0.6);
+                o.b = start;
+            }
+            draw_live(e);
+        }
+        Drag::Tip => {
+            if let Some(o) = e.live.as_mut() {
+                o.b = p;
+            }
+            draw_live(e);
+        }
         Drag::Crop { start } => {
             let b = constrain(e, start, p);
             let (w, h) = (e.base.w as f32, e.base.h as f32);
@@ -1023,6 +1056,16 @@ unsafe fn on_up(e: &mut Ed) {
                 }
             }
         }
+        Drag::Tip => {
+            // Tip back inside the box: no tail.
+            if let Some(o) = e.live.as_mut() {
+                if o.bubble(e.scale).is_some_and(|b| b.tail.is_none()) {
+                    o.b = o.a;
+                }
+            }
+            commit_live(e);
+        }
+        Drag::TextTail { .. } => {} // keep typing into the new text box
         Drag::Crop { .. } => {
             if let Some(c) = e.live_crop.take().filter(|&c| clip_rect(c, e.base.w, e.base.h).is_some()) {
                 snapshot(e);

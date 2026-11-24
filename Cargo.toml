@@ -1,6 +1,6 @@
 [package]
 name = "shotclip"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Screenshot tool for Windows: macOS-style capture, scrolling capture, OCR, colour picker, pixel ruler + Clop-style clipboard optimiser"
 license = "GPL-3.0-or-later" # imagequant (libimagequant) is GPL-3.0
