@@ -198,3 +198,17 @@ pub fn write(hwnd: HWND, out: &Output, expected_seq: Option<u32>) -> bool {
     }
     true
 }
+
+/// Puts plain text on the clipboard (OCR result, colour, measurement).
+pub fn write_text(hwnd: HWND, text: &str) -> bool {
+    let Some(_g) = open(hwnd) else { return false };
+    unsafe {
+        if EmptyClipboard() == 0 {
+            return false;
+        }
+        let t: Vec<u8> = text.encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect();
+        set_bytes(CF_UNICODETEXT, &t);
+        set_bytes(formats().marker, b"text\0");
+    }
+    true
+}

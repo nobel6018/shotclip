@@ -2,6 +2,9 @@
 //!
 //! - Alt+Shift+3 / Alt+Shift+4: macOS-style capture (see capture.rs). Results go through the
 //!   same optimiser, onto the clipboard and (optionally) to the Desktop like macOS.
+//! - Alt+Shift+5 scrolling capture, 6 OCR, 7 colour picker, 8 pixel ruler (Shottr-style tools,
+//!   see overlay.rs / scroll.rs / ocr.rs).
+//! - In-app updates from GitHub Releases (updater.rs).
 //! - Watches the clipboard; when a plain image arrives (e.g. Win+Shift+S), it quantises it
 //!   like Clop (pngquant engine), saves it to %LOCALAPPDATA%\ShotClip\images and puts
 //!   PNG + CF_DIB (+ file + path text) back on the clipboard.
@@ -11,8 +14,12 @@
 
 mod capture;
 mod clip;
+mod ocr;
 mod optimize;
+mod overlay;
+mod scroll;
 mod store;
+mod updater;
 
 use clip::wide;
 use optimize as opt;
@@ -24,7 +31,7 @@ use std::{
     path::PathBuf,
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, Mutex,
     },
     thread,
@@ -37,6 +44,12 @@ use windows_sys::Win32::{
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_DONE: u32 = WM_APP + 2;
+const WM_OCR: u32 = WM_APP + 3;
+/// wParam 1 = checked from the menu (report "up to date" / errors too).
+const WM_UPDATE_CHECKED: u32 = WM_APP + 4;
+const WM_UPDATE_INSTALLED: u32 = WM_APP + 5;
+const TIMER_UPDATE: usize = 4;
+const UPDATE_EVERY_MS: u32 = 12 * 3600 * 1000;
 const TIMER_DEBOUNCE: usize = 1;
 const TIMER_HOTKEYS: usize = 2;
 const TIMER_CLEANUP: usize = 3;
@@ -48,9 +61,18 @@ const VK_MINUS: u32 = 0xBD;
 const VK_Z: u32 = 0x5A;
 const HK_CAPTURE_FULL: i32 = 10;
 const HK_CAPTURE_AREA: i32 = 11;
+const HK_SCROLL: i32 = 12;
+const HK_OCR: i32 = 13;
+const HK_COLOR: i32 = 14;
+const HK_RULER: i32 = 15;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static RESULTS: Mutex<VecDeque<Result<Done, String>>> = Mutex::new(VecDeque::new());
+static OCR_RESULTS: Mutex<VecDeque<Result<String, String>>> = Mutex::new(VecDeque::new());
+static UPDATE_RESULT: Mutex<Option<Result<Option<updater::Update>, String>>> = Mutex::new(None);
+static INSTALL_RESULT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+/// The balloon on screen is the "new version" one (clicking it installs).
+static UPDATE_BALLOON: AtomicBool = AtomicBool::new(false);
 
 enum Job {
     Optimise { seq: u32, src: clip::Source },
@@ -97,6 +119,8 @@ struct App {
     copy_path: bool,
     save_desktop: bool,
     hotkeys: bool,
+    update: Option<updater::Update>,
+    installing: bool,
     last: Option<Last>,
 }
 
@@ -239,7 +263,7 @@ unsafe fn nid(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 fn tip(paused: bool) -> &'static str {
-    if paused { "ShotClip (최적화 일시정지) · Alt+Shift+3/4 캡처" } else { "ShotClip · Alt+Shift+3/4 캡처 · 클립보드 최적화 중" }
+    if paused { "ShotClip (최적화 일시정지) · Alt+Shift+3~8" } else { "ShotClip · Alt+Shift+3 전체 4 영역 5 스크롤 6 OCR 7 색상 8 자" }
 }
 
 /// Icon resource 1 (embedded by build.rs) at the given size, falling back to the stock icon.
@@ -266,6 +290,7 @@ unsafe fn tray_tip(hwnd: HWND, paused: bool) {
 }
 
 unsafe fn notify(hwnd: HWND, title: &str, body: &str) {
+    UPDATE_BALLOON.store(false, Ordering::Relaxed);
     let mut n = nid(hwnd);
     n.uFlags = NIF_INFO;
     copy_w(&mut n.szInfoTitle, title);
@@ -287,6 +312,10 @@ unsafe fn show_menu(hwnd: HWND) {
     item(6, "캡처를 바탕화면에도 저장 (Alt+Shift+3/4)", save_desktop);
     item(3, "Windows 시작 시 실행", auto);
     AppendMenuW(m, MF_SEPARATOR, 0, null());
+    match with_app(|a| a.update.as_ref().map(|u| u.version.clone())).flatten() {
+        Some(v) => item(7, &format!("업데이트하고 다시 켜기 ({} → {v})", updater::VERSION), false),
+        None => item(7, &format!("업데이트 확인 (현재 {})", updater::VERSION), false),
+    }
     item(4, "작업 폴더 열기", false);
     item(5, "종료", false);
 
@@ -319,6 +348,13 @@ unsafe fn show_menu(hwnd: HWND) {
             store::set_bool("SaveToDesktop", !save_desktop);
         }
         3 => store::set_autostart(!auto),
+        7 => {
+            if with_app(|a| a.update.is_some()).unwrap_or(false) {
+                start_install(hwnd);
+            } else {
+                start_check(hwnd, true);
+            }
+        }
         4 => {
             let dir = wide(&store::workdir().to_string_lossy());
             ShellExecuteW(hwnd, wide("open").as_ptr(), dir.as_ptr(), null(), null(), SW_SHOWNORMAL);
@@ -342,6 +378,115 @@ pub unsafe fn on_capture(_hwnd: HWND, imgs: Vec<opt::Rgba>, clip_idx: usize) {
             capture::unique(&dir, &name)
         });
         let _ = tx.send(Job::Capture { img, desktop, clip: i == clip_idx });
+    }
+}
+
+/// Text result (colour, measurement): clipboard + notification.
+pub unsafe fn on_text(hwnd: HWND, title: &str, text: &str) {
+    set_hotkeys(hwnd, false);
+    if clip::write_text(hwnd, text) {
+        notify(hwnd, title, "클립보드에 복사했습니다");
+    }
+}
+
+/// Runs OCR on a worker thread (WinRT calls block); the result comes back as WM_OCR.
+pub(crate) unsafe fn on_ocr(hwnd: HWND, img: capture::Img, dpi: u32) {
+    let h = hwnd as usize;
+    thread::spawn(move || {
+        let r = std::panic::catch_unwind(|| ocr::recognize(img.w, img.h, &img.px, dpi))
+            .unwrap_or_else(|_| Err("내부 오류(panic)".into()));
+        OCR_RESULTS.lock().unwrap().push_back(r);
+        unsafe { PostMessageW(h as HWND, WM_OCR, 0, 0) };
+    });
+}
+
+unsafe fn on_ocr_done(hwnd: HWND) {
+    let Some(r) = OCR_RESULTS.lock().unwrap().pop_front() else { return };
+    match r {
+        Ok(t) if t.trim().is_empty() => notify(hwnd, "텍스트 인식", "인식된 텍스트가 없습니다"),
+        Ok(t) => {
+            set_hotkeys(hwnd, false);
+            if clip::write_text(hwnd, &t) {
+                let preview: String = t.chars().take(120).collect();
+                let n = t.lines().count();
+                notify(hwnd, &format!("텍스트 복사 · {n}줄 {}자", t.chars().count()), &preview);
+            }
+        }
+        Err(e) => notify(hwnd, "텍스트 인식 실패", &e),
+    }
+}
+
+/// Alt+Shift+3..8. While a scroll capture runs, any of them ends it (5 saves, others cancel).
+unsafe fn on_tool(hwnd: HWND, id: i32) {
+    if scroll::active() {
+        scroll::finish(id == HK_SCROLL);
+        return;
+    }
+    if id != HK_CAPTURE_FULL {
+        // The focused app saw Alt down/up with our key swallowed; see capture_full.
+        keybd_event(0xE8, 0, 0, 0);
+        keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+    }
+    match id {
+        HK_CAPTURE_FULL => capture::capture_full(hwnd),
+        HK_CAPTURE_AREA => overlay::start(hwnd, overlay::Mode::Area),
+        HK_SCROLL => overlay::start(hwnd, overlay::Mode::Scroll),
+        HK_OCR => overlay::start(hwnd, overlay::Mode::Ocr),
+        HK_COLOR => overlay::start(hwnd, overlay::Mode::Color),
+        _ => overlay::start(hwnd, overlay::Mode::Ruler),
+    }
+}
+
+// ---------------------------------------------------------------- update
+
+unsafe fn start_check(hwnd: HWND, manual: bool) {
+    let h = hwnd as usize;
+    thread::spawn(move || {
+        *UPDATE_RESULT.lock().unwrap() = Some(updater::check());
+        unsafe { PostMessageW(h as HWND, WM_UPDATE_CHECKED, manual as usize, 0) };
+    });
+}
+
+unsafe fn on_update_checked(hwnd: HWND, manual: bool) {
+    let Some(r) = UPDATE_RESULT.lock().unwrap().take() else { return };
+    match r {
+        Ok(Some(u)) => {
+            let v = u.version.clone();
+            let known = with_app(|a| a.update.replace(u).is_some_and(|old| old.version == v)).unwrap_or(false);
+            if manual || !known {
+                notify(hwnd, &format!("ShotClip {v} 새 버전"), "이 알림을 누르거나 트레이 메뉴에서 \"업데이트하고 다시 켜기\"");
+                UPDATE_BALLOON.store(true, Ordering::Relaxed);
+            }
+        }
+        Ok(None) if manual => notify(hwnd, "ShotClip", &format!("최신 버전({})입니다", updater::VERSION)),
+        Err(e) if manual => notify(hwnd, "업데이트 확인 실패", &e),
+        _ => {}
+    }
+}
+
+/// Like sori: refuses while something is in progress instead of interrupting it.
+unsafe fn start_install(hwnd: HWND) {
+    let Some(Some(u)) = with_app(|a| if a.installing { None } else { a.update.clone() }) else { return };
+    if overlay::is_open() || scroll::active() {
+        return notify(hwnd, "업데이트 대기", "진행 중인 캡처를 끝낸 뒤 다시 눌러 주세요");
+    }
+    with_app(|a| a.installing = true);
+    notify(hwnd, &format!("ShotClip {} 받는 중", u.version), "끝나면 자동으로 다시 켜집니다");
+    let h = hwnd as usize;
+    thread::spawn(move || {
+        *INSTALL_RESULT.lock().unwrap() = Some(updater::install(&u));
+        unsafe { PostMessageW(h as HWND, WM_UPDATE_INSTALLED, 0, 0) };
+    });
+}
+
+unsafe fn on_update_installed(hwnd: HWND) {
+    with_app(|a| a.installing = false);
+    match INSTALL_RESULT.lock().unwrap().take() {
+        Some(Ok(())) => {
+            DestroyWindow(hwnd); // the new exe is already waiting for us to exit
+        }
+        Some(Err(e)) => notify(hwnd, "업데이트하지 못했습니다", &e),
+        None => {}
     }
 }
 
@@ -467,24 +612,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             TIMER_DEBOUNCE => on_debounce(hwnd),
             TIMER_HOTKEYS => set_hotkeys(hwnd, false),
             TIMER_CLEANUP => drop(thread::spawn(store::cleanup)),
+            scroll::TIMER_ID => scroll::tick(),
+            TIMER_UPDATE => start_check(hwnd, false),
             _ => {}
         },
         WM_HOTKEY => match wp as i32 {
-            HK_CAPTURE_FULL => capture::capture_full(hwnd),
-            HK_CAPTURE_AREA => capture::start_area(hwnd),
+            id @ HK_CAPTURE_FULL..=HK_RULER => on_tool(hwnd, id),
+            id @ (scroll::HK_DONE | scroll::HK_CANCEL | scroll::HK_AUTO) => scroll::on_hotkey(id),
             which => on_hotkey(hwnd, which),
         },
         WM_DONE => on_done(hwnd),
+        WM_OCR => on_ocr_done(hwnd),
+        WM_UPDATE_CHECKED => on_update_checked(hwnd, wp == 1),
+        WM_UPDATE_INSTALLED => on_update_installed(hwnd),
         WM_TRAY => {
             let ev = (lp as u32) & 0xFFFF;
             if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
                 show_menu(hwnd);
+            } else if ev == NIN_BALLOONUSERCLICK && UPDATE_BALLOON.swap(false, Ordering::Relaxed) {
+                start_install(hwnd);
             }
         }
         WM_DESTROY => {
             set_hotkeys(hwnd, false);
-            UnregisterHotKey(hwnd, HK_CAPTURE_FULL);
-            UnregisterHotKey(hwnd, HK_CAPTURE_AREA);
+            scroll::finish(false);
+            for id in HK_CAPTURE_FULL..=HK_RULER {
+                UnregisterHotKey(hwnd, id);
+            }
             Shell_NotifyIconW(NIM_DELETE, &nid(hwnd));
             PostQuitMessage(0);
         }
@@ -495,6 +649,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    let updated = updater::after_update(); // waits for the previous version to exit
     unsafe {
         CreateMutexW(null(), 0, wide(r"Local\ShotClip.SingleInstance").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -504,11 +659,17 @@ fn main() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
         let mut oc: WNDCLASSW = zeroed();
-        oc.lpfnWndProc = Some(capture::overlay_proc);
+        oc.lpfnWndProc = Some(overlay::overlay_proc);
         oc.hInstance = hinst;
-        let oc_name = wide(capture::OVERLAY_CLASS);
+        let oc_name = wide(overlay::OVERLAY_CLASS);
         oc.lpszClassName = oc_name.as_ptr();
         RegisterClassW(&oc);
+        let mut fc: WNDCLASSW = zeroed();
+        fc.lpfnWndProc = Some(scroll::frame_proc);
+        fc.hInstance = hinst;
+        let fc_name = wide(scroll::FRAME_CLASS);
+        fc.lpszClassName = fc_name.as_ptr();
+        RegisterClassW(&fc);
         let class = wide("ShotClipWnd");
         let mut wc: WNDCLASSW = zeroed();
         wc.lpfnWndProc = Some(wndproc);
@@ -544,6 +705,8 @@ fn main() {
                 copy_path: store::get_bool("CopyPath", true),
                 save_desktop: store::get_bool("SaveToDesktop", true),
                 hotkeys: false,
+                update: None,
+                installing: false,
                 last: None,
             })
         });
@@ -553,13 +716,22 @@ fn main() {
         AddClipboardFormatListener(hwnd);
         store::migrate_autostart();
         let mods = MOD_ALT | MOD_SHIFT | MOD_NOREPEAT;
-        let ok3 = RegisterHotKey(hwnd, HK_CAPTURE_FULL, mods, '3' as u32) != 0;
-        let ok4 = RegisterHotKey(hwnd, HK_CAPTURE_AREA, mods, '4' as u32) != 0;
-        if !(ok3 && ok4) {
-            notify(hwnd, "ShotClip", "Alt+Shift+3/4 단축키를 등록하지 못했습니다 (다른 앱이 사용 중).");
+        let failed: Vec<String> = (HK_CAPTURE_FULL..=HK_RULER)
+            .zip('3'..='8')
+            .filter(|(id, key)| RegisterHotKey(hwnd, *id, mods, *key as u32) == 0)
+            .map(|(_, key)| key.to_string())
+            .collect();
+        if !failed.is_empty() {
+            let keys = failed.join(", ");
+            notify(hwnd, "ShotClip", &format!("Alt+Shift+{keys} 단축키를 등록하지 못했습니다 (다른 앱이 사용 중)."));
         }
         thread::spawn(store::cleanup);
         SetTimer(hwnd, TIMER_CLEANUP, 6 * 3600 * 1000, None);
+        if updated {
+            notify(hwnd, "ShotClip", &format!("{} 버전으로 업데이트했습니다", updater::VERSION));
+        }
+        start_check(hwnd, false);
+        SetTimer(hwnd, TIMER_UPDATE, UPDATE_EVERY_MS, None);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
