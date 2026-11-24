@@ -1,5 +1,7 @@
-//! ShrinkClip: Clop-style clipboard screenshot optimiser for Windows.
+//! ShrinkClip: screenshot tool for Windows.
 //!
+//! - Alt+Shift+3 / Alt+Shift+4: macOS-style capture (see capture.rs). Results go through the
+//!   same optimiser, onto the clipboard and (optionally) to the Desktop like macOS.
 //! - Watches the clipboard; when a plain image arrives (e.g. Win+Shift+S), it quantises it
 //!   like Clop (pngquant engine), saves it to %LOCALAPPDATA%\ShrinkClip\images and puts
 //!   PNG + CF_DIB (+ file + path text) back on the clipboard.
@@ -7,6 +9,7 @@
 //!   the original. Like Clop, the keys are only grabbed while a result is "live".
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod capture;
 mod clip;
 mod optimize;
 mod store;
@@ -29,7 +32,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     System::{DataExchange::AddClipboardFormatListener, LibraryLoader::GetModuleHandleW, Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize}},
-    UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+    UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -43,6 +46,8 @@ const HOTKEY_WINDOW_MS: u32 = 30_000;
 const DEBOUNCE_MS: u32 = 150;
 const VK_MINUS: u32 = 0xBD;
 const VK_Z: u32 = 0x5A;
+const HK_CAPTURE_FULL: i32 = 10;
+const HK_CAPTURE_AREA: i32 = 11;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static RESULTS: Mutex<VecDeque<Result<Done, String>>> = Mutex::new(VecDeque::new());
@@ -51,6 +56,7 @@ enum Job {
     Optimise { seq: u32, src: clip::Source },
     Scale { id: String, original: PathBuf, factor: f64 },
     Restore { id: String, original: PathBuf },
+    Capture { img: opt::Rgba, desktop: Option<PathBuf>, clip: bool },
 }
 
 #[derive(PartialEq)]
@@ -58,6 +64,7 @@ enum Kind {
     Optimised,
     Scaled,
     Restored,
+    Captured,
 }
 
 struct Done {
@@ -73,6 +80,9 @@ struct Done {
     w: u32,
     h: u32,
     kept_original: bool,
+    /// Put the result on the clipboard (false for extra monitors of a full-screen capture).
+    clip: bool,
+    desktop: Option<PathBuf>,
 }
 
 struct Last {
@@ -85,6 +95,7 @@ struct App {
     jobs: mpsc::Sender<Job>,
     paused: bool,
     copy_path: bool,
+    save_desktop: bool,
     hotkeys: bool,
     last: Option<Last>,
 }
@@ -154,7 +165,24 @@ fn run(job: Job) -> opt::Result<Done> {
                 h: img.h,
                 png,
                 kept_original: true,
+                clip: true,
+                desktop: None,
             })
+        }
+        Job::Capture { img, desktop, clip } => {
+            let id = store::timestamp();
+            let orig_png = opt::encode_png(&img)?;
+            let original = store::originals_dir().join(format!("screenshot_{id}.png"));
+            fs::write(&original, &orig_png)?;
+            let path = store::images_dir().join(format!("screenshot_{id}.png"));
+            let before = orig_png.len();
+            let mut d = compress(Kind::Captured, None, id, original, 1.0, img, orig_png, before, path)?;
+            if let Some(dst) = &desktop {
+                fs::write(dst, &d.png)?;
+            }
+            d.clip = clip;
+            d.desktop = desktop;
+            Ok(d)
         }
     }
 }
@@ -189,6 +217,8 @@ fn compress(
         png,
         path,
         kept_original,
+        clip: true,
+        desktop: None,
     })
 }
 
@@ -245,7 +275,7 @@ unsafe fn notify(hwnd: HWND, title: &str, body: &str) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let Some((paused, copy_path)) = with_app(|a| (a.paused, a.copy_path)) else { return };
+    let Some((paused, copy_path, save_desktop)) = with_app(|a| (a.paused, a.copy_path, a.save_desktop)) else { return };
     let auto = store::autostart_enabled();
     let m = CreatePopupMenu();
     let item = |id: usize, text: &str, checked: bool| {
@@ -254,6 +284,7 @@ unsafe fn show_menu(hwnd: HWND) {
     };
     item(1, "일시정지", paused);
     item(2, "파일 경로도 복사 (Clop 기본값)", copy_path);
+    item(6, "캡처를 바탕화면에도 저장 (Alt+Shift+3/4)", save_desktop);
     item(3, "Windows 시작 시 실행", auto);
     AppendMenuW(m, MF_SEPARATOR, 0, null());
     item(4, "작업 폴더 열기", false);
@@ -283,6 +314,10 @@ unsafe fn show_menu(hwnd: HWND) {
             .unwrap_or(true);
             store::set_bool("CopyPath", c);
         }
+        6 => {
+            with_app(|a| a.save_desktop = !save_desktop);
+            store::set_bool("SaveToDesktop", !save_desktop);
+        }
         3 => store::set_autostart(!auto),
         4 => {
             let dir = wide(&store::workdir().to_string_lossy());
@@ -292,6 +327,21 @@ unsafe fn show_menu(hwnd: HWND) {
             DestroyWindow(hwnd);
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------- capture
+
+/// Called by capture.rs with the captured image(s); `clip_idx` is the one for the clipboard.
+pub unsafe fn on_capture(_hwnd: HWND, imgs: Vec<opt::Rgba>, clip_idx: usize) {
+    let Some((tx, save)) = with_app(|a| (a.jobs.clone(), a.save_desktop)) else { return };
+    let (dir, base, many) = (capture::desktop_dir(), capture::base_name(), imgs.len() > 1);
+    for (i, img) in imgs.into_iter().enumerate() {
+        let desktop = save.then(|| {
+            let name = if many { format!("{base} ({})", i + 1) } else { base.clone() };
+            capture::unique(&dir, &name)
+        });
+        let _ = tx.send(Job::Capture { img, desktop, clip: i == clip_idx });
     }
 }
 
@@ -368,16 +418,21 @@ unsafe fn on_done(hwnd: HWND) {
         Ok(d) => d,
         Err(e) => return notify(hwnd, "ShrinkClip 오류", &e),
     };
+    if !d.clip {
+        return; // extra monitor of a full-screen capture: file only
+    }
     // Downscale/restore results only apply if the clipboard still holds this result.
-    if d.seq.is_none() && clip::marker_id(hwnd).as_deref() != Some(d.id.as_str()) {
+    let fresh = matches!(d.kind, Kind::Optimised | Kind::Captured);
+    if !fresh && clip::marker_id(hwnd).as_deref() != Some(d.id.as_str()) {
         return;
     }
     let copy_path = with_app(|a| a.copy_path).unwrap_or(true);
-    let out = clip::Output { id: &d.id, png: &d.png, dib: &d.dib, path: &d.path, with_path: copy_path };
+    let path = d.desktop.as_deref().unwrap_or(&d.path);
+    let out = clip::Output { id: &d.id, png: &d.png, dib: &d.dib, path, with_path: copy_path };
     if !clip::write(hwnd, &out, d.seq) {
         return; // clipboard changed meanwhile; drop the stale result
     }
-    if d.kind == Kind::Optimised {
+    if fresh {
         with_app(|a| a.last = Some(Last { id: d.id.clone(), original: d.original.clone(), factor: d.factor }));
     }
     set_hotkeys(hwnd, true);
@@ -388,10 +443,14 @@ unsafe fn on_done(hwnd: HWND) {
         Kind::Optimised => format!("스크린샷 최적화 · {}×{}", d.w, d.h),
         Kind::Scaled => format!("{}% 축소 · {}×{}", (d.factor * 100.0).round(), d.w, d.h),
         Kind::Restored => format!("원본 복원 · {}×{}", d.w, d.h),
+        Kind::Captured => match &d.desktop {
+            Some(p) => format!("{} · {}×{}", p.file_stem().unwrap_or_default().to_string_lossy(), d.w, d.h),
+            None => format!("스크린샷 · {}×{}", d.w, d.h),
+        },
     };
     let size = if d.kind == Kind::Restored {
         opt::human(after)
-    } else if d.kept_original && d.kind == Kind::Optimised {
+    } else if d.kept_original && fresh {
         format!("{} (이미 최적 상태라 원본 유지)", opt::human(after))
     } else {
         format!("{} → {} (−{saved}%)", opt::human(d.before), opt::human(after))
@@ -410,7 +469,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             TIMER_CLEANUP => drop(thread::spawn(store::cleanup)),
             _ => {}
         },
-        WM_HOTKEY => on_hotkey(hwnd, wp as i32),
+        WM_HOTKEY => match wp as i32 {
+            HK_CAPTURE_FULL => capture::capture_full(hwnd),
+            HK_CAPTURE_AREA => capture::start_area(hwnd),
+            which => on_hotkey(hwnd, which),
+        },
         WM_DONE => on_done(hwnd),
         WM_TRAY => {
             let ev = (lp as u32) & 0xFFFF;
@@ -420,6 +483,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             set_hotkeys(hwnd, false);
+            UnregisterHotKey(hwnd, HK_CAPTURE_FULL);
+            UnregisterHotKey(hwnd, HK_CAPTURE_AREA);
             Shell_NotifyIconW(NIM_DELETE, &nid(hwnd));
             PostQuitMessage(0);
         }
@@ -435,7 +500,15 @@ fn main() {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
+        // Physical pixels everywhere, so captures are full resolution on scaled displays.
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
+        let mut oc: WNDCLASSW = zeroed();
+        oc.lpfnWndProc = Some(capture::overlay_proc);
+        oc.hInstance = hinst;
+        let oc_name = wide(capture::OVERLAY_CLASS);
+        oc.lpszClassName = oc_name.as_ptr();
+        RegisterClassW(&oc);
         let class = wide("ShrinkClipWnd");
         let mut wc: WNDCLASSW = zeroed();
         wc.lpfnWndProc = Some(wndproc);
@@ -469,6 +542,7 @@ fn main() {
                 jobs: tx,
                 paused: store::get_bool("Paused", false),
                 copy_path: store::get_bool("CopyPath", true),
+                save_desktop: store::get_bool("SaveToDesktop", true),
                 hotkeys: false,
                 last: None,
             })
@@ -477,6 +551,12 @@ fn main() {
 
         tray_add(hwnd);
         AddClipboardFormatListener(hwnd);
+        let mods = MOD_ALT | MOD_SHIFT | MOD_NOREPEAT;
+        let ok3 = RegisterHotKey(hwnd, HK_CAPTURE_FULL, mods, '3' as u32) != 0;
+        let ok4 = RegisterHotKey(hwnd, HK_CAPTURE_AREA, mods, '4' as u32) != 0;
+        if !(ok3 && ok4) {
+            notify(hwnd, "ShrinkClip", "Alt+Shift+3/4 단축키를 등록하지 못했습니다 (다른 앱이 사용 중).");
+        }
         thread::spawn(store::cleanup);
         SetTimer(hwnd, TIMER_CLEANUP, 6 * 3600 * 1000, None);
 
