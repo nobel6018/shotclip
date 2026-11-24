@@ -171,11 +171,36 @@ fn run(job: Job) -> opt::Result<Done> {
         }
         Job::Scale { id, original, factor } => {
             let orig_png = fs::read(&original)?;
-            let img = opt::resize(&opt::decode_png(&orig_png)?, factor)?;
+            let src = opt::decode_png(&orig_png)?;
+            let img = opt::resize(&src, factor)?;
             let baseline = opt::encode_png(&img)?;
             let pct = (factor * 100.0).round() as u32;
             let path = store::images_dir().join(format!("screenshot_{id}_{pct}pct.png"));
-            compress(Kind::Scaled, None, id, original, factor, img, baseline, orig_png.len(), path)
+            let mut d = compress(Kind::Scaled, None, id, original, factor, img, baseline, orig_png.len(), path)?;
+            // Clop: an optimiser should never grow a file. A downscaled flat screenshot can, because
+            // resampling adds anti-aliased colours; re-quantise smaller or fall back to the original.
+            if d.png.len() > orig_png.len() {
+                let small = opt::resize(&src, factor)?;
+                match opt::shrink_below(&small, &src, orig_png.len()) {
+                    Some((png, pix)) => {
+                        fs::write(&d.path, &png)?;
+                        d.dib = opt::encode_dib(&pix);
+                        d.png = png;
+                        d.kept_original = false;
+                    }
+                    None => {
+                        d.kind = Kind::Restored;
+                        d.factor = 1.0;
+                        d.dib = opt::encode_dib(&src);
+                        d.w = src.w;
+                        d.h = src.h;
+                        d.path = d.original.clone();
+                        d.png = orig_png;
+                        d.kept_original = true;
+                    }
+                }
+            }
+            Ok(d)
         }
         Job::Restore { id, original } => {
             let png = fs::read(&original)?;

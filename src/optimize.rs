@@ -112,9 +112,17 @@ pub fn encode_png(img: &Rgba) -> Result<Vec<u8>> {
 /// Lossy palette quantisation (libimagequant = the engine behind pngquant).
 /// Returns the PNG bytes and the remapped pixels (so CF_DIB matches the PNG exactly).
 pub fn quantize_png(img: &Rgba) -> Result<(Vec<u8>, Rgba)> {
+    // Clop's default ("normal", factor 30): pngquant --force --speed 4 --quality 0-100, 256 colours.
+    quantize_png_with(img, 4, 256)
+}
+
+/// pngquant with an explicit speed and palette size (Clop's downscale fallback uses
+/// `pngquant <colors> --speed 1`).
+pub fn quantize_png_with(img: &Rgba, speed: i32, colors: u32) -> Result<(Vec<u8>, Rgba)> {
     let mut liq = imagequant::new();
-    liq.set_speed(4)?; // Clop: pngquant --speed 4 at the default factor
-    liq.set_quality(0, 100)?; // Clop: pngquant --quality 0-100 at the default factor
+    liq.set_speed(speed)?;
+    liq.set_quality(0, 100)?;
+    liq.set_max_colors(colors.clamp(2, 256))?;
     let pixels: Vec<imagequant::RGBA> = img
         .px
         .chunks_exact(4)
@@ -148,6 +156,43 @@ pub fn quantize_png(img: &Rgba) -> Result<(Vec<u8>, Rgba)> {
         })
         .collect();
     Ok((out, Rgba { w: img.w, h: img.h, px }))
+}
+
+/// Distinct colours up to `cap` (None = more than `cap`). Like Clop, large images are sampled
+/// nearest-neighbour to at most ~1 M pixels, which never invents colours.
+pub fn unique_colors(img: &Rgba, cap: usize) -> Option<usize> {
+    let n = img.w as usize * img.h as usize;
+    let step = ((n as f64 / 1_000_000.0).sqrt().ceil() as usize).max(1);
+    let mut seen = std::collections::HashSet::new();
+    for y in (0..img.h as usize).step_by(step) {
+        for x in (0..img.w as usize).step_by(step) {
+            let i = (y * img.w as usize + x) * 4;
+            seen.insert(u32::from_le_bytes([img.px[i], img.px[i + 1], img.px[i + 2], img.px[i + 3]]));
+            if seen.len() > cap {
+                return None;
+            }
+        }
+    }
+    Some(seen.len())
+}
+
+/// Clop's fix for downscales that grow the file (anti-aliasing turns a few flat colours into many):
+/// re-quantise toward the original's colour count, then 128/64/32/16, at speed 1; the first one
+/// smaller than `limit` bytes wins. None = keep the original.
+pub fn shrink_below(img: &Rgba, original: &Rgba, limit: usize) -> Option<(Vec<u8>, Rgba)> {
+    let mut candidates: Vec<u32> = Vec::new();
+    if let Some(n) = unique_colors(original, 256) {
+        candidates.push(n.clamp(2, 256) as u32);
+    }
+    for c in [128, 64, 32, 16] {
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|c| quantize_png_with(img, 1, c).ok())
+        .find(|(png, _)| png.len() < limit)
 }
 
 pub fn resize(img: &Rgba, factor: f64) -> Result<Rgba> {
@@ -189,5 +234,31 @@ pub fn human(bytes: usize) -> String {
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
         b if b >= 1 << 10 => format!("{} KB", b >> 10),
         b => format!("{b} B"),
+    }
+}
+
+#[cfg(test)]
+mod clop_tests {
+    use super::*;
+
+    /// Flat 3-colour "UI" image: the downscale re-quantised toward 3 colours must beat the original.
+    #[test]
+    fn downscale_of_flat_image_does_not_grow() {
+        let (w, h) = (400u32, 300u32);
+        let mut px = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let c: [u8; 4] = if (x / 7 + y / 5) % 3 == 0 { [20, 20, 20, 255] } else if x % 11 < 2 { [30, 120, 220, 255] } else { [250, 250, 250, 255] };
+                px.extend_from_slice(&c);
+            }
+        }
+        let src = Rgba { w, h, px };
+        assert_eq!(unique_colors(&src, 256), Some(3));
+        let (orig, _) = quantize_png(&src).unwrap();
+        let small = resize(&src, 0.75).unwrap();
+        if let Some((png, pix)) = shrink_below(&small, &src, orig.len()) {
+            assert!(png.len() < orig.len());
+            assert_eq!((pix.w, pix.h), (300, 225));
+        }
     }
 }
